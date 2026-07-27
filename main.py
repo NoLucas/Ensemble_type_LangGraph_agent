@@ -16,11 +16,14 @@ from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, START, END
 
+# .env 파일에서 ANTHROPIC_API_KEY 등 환경변수를 로드
 load_dotenv()
 
 MODEL_NAME = "claude-sonnet-5"
 
 
+# LangGraph 노드 간에 공유되는 전체 상태.
+# 각 튜터의 질문/답변 필드는 선택 사항(Optional)이며, 질문이 없으면 해당 튜터는 통과한다.
 class GraphState(TypedDict):
     java_question: Optional[str]
     oop_question: Optional[str]
@@ -32,6 +35,7 @@ class GraphState(TypedDict):
     project_summary: Optional[str]
 
 
+# 노드마다 매번 새 LLM 인스턴스를 생성해 상태를 공유하지 않도록 한다.
 def make_llm() -> ChatAnthropic:
     return ChatAnthropic(model=MODEL_NAME, max_tokens=1024)
 
@@ -59,6 +63,7 @@ PROJECT_COACH_SYSTEM_PROMPT = """당신은 실전 프로젝트 코치입니다.
 통합적인 관점에서 조언하세요. 각 튜터 답변을 반복 설명하지 말고, 다음 학습 단계를 제안하세요."""
 
 
+# 질문이 없으면 아무 것도 하지 않고 통과(pass-through)한다.
 def java_tutor(state: GraphState) -> GraphState:
     question = state.get("java_question")
     if not question:
@@ -92,6 +97,8 @@ def backend_db_tutor(state: GraphState) -> GraphState:
     return {"backend_db_answer": response.content}
 
 
+# fan-in 노드: 세 튜터의 답변을 모아 실전 프로젝트 관점의 통합 코멘트를 생성한다.
+# 사용자가 원치 않거나(ask_project_coach=False) 참고할 답변이 하나도 없으면 건너뛴다.
 def project_coach(state: GraphState) -> GraphState:
     if not state.get("ask_project_coach"):
         return {"project_summary": None}
@@ -117,6 +124,7 @@ def project_coach(state: GraphState) -> GraphState:
     return {"project_summary": response.content}
 
 
+# 그래프 구조: START에서 세 튜터로 병렬 fan-out 후, project_coach로 fan-in하여 END.
 def build_graph():
     graph = StateGraph(GraphState)
 
@@ -166,11 +174,13 @@ def run_interactive(app):
             print("종료합니다.")
             break
 
+        # 쉼표로 구분된 입력에서 유효한 메뉴 번호만 남긴다.
         selected_numbers = [c.strip() for c in choice.split(",") if c.strip() in TOPIC_FIELD_MAP]
         if not selected_numbers:
             print("1, 2, 3 중에서 선택해주세요.")
             continue
 
+        # 선택한 주제별로 질문을 입력받아 그래프 입력(state)을 구성한다.
         graph_input = {}
         for number in selected_numbers:
             field = TOPIC_FIELD_MAP[number]
@@ -186,6 +196,7 @@ def run_interactive(app):
         want_coach = input("실전 프로젝트 코치의 통합 코멘트도 받을까요? (y/n): ").strip().lower() == "y"
         graph_input["ask_project_coach"] = want_coach
 
+        # 그래프를 실행하면 병렬 fan-out -> fan-in이 자동으로 처리된다.
         result = app.invoke(graph_input)
 
         for field, label in ANSWER_LABEL_MAP.items():
@@ -199,6 +210,7 @@ def run_interactive(app):
 
 
 if __name__ == "__main__":
+    # API 키가 없으면 그래프 실행 시점이 아니라 시작 시점에 바로 알려준다.
     if not os.getenv("ANTHROPIC_API_KEY"):
         raise SystemExit(".env에 ANTHROPIC_API_KEY를 설정하세요 (.env.example 참고)")
 

@@ -90,3 +90,98 @@ python main.py
 - `langgraph` — 에이전트 그래프 오케스트레이션
 - `langchain-anthropic` — Anthropic(Claude) 모델 연동
 - `python-dotenv` — `.env` 환경변수 로드
+
+---
+
+# English
+
+A Java learning assistant example built with LangGraph, orchestrating 4 agents.
+
+## Architecture
+
+```
+        START
+          |
+   ┌──────┼──────────────┐
+   ▼      ▼              ▼
+java_tutor oop_tutor  backend_db_tutor      (parallel fan-out)
+   └──────┼──────────────┘
+          ▼
+   project_coach                            (fan-in, combined feedback)
+          │
+          ▼
+         END
+```
+
+- **java_tutor**: handles Java basics — variables/types, conditionals, loops, arrays, methods, exception handling
+- **oop_tutor**: handles OOP — classes/objects, constructors, inheritance, interfaces, polymorphism
+- **backend_db_tutor**: handles backend/DB — HTTP, REST API, Controller-Service-Repository flow, SQL, JPA
+- **project_coach**: reads the three tutors' answers and gives integrated advice on applying them in a real project
+
+The three tutors run in parallel; each node passes through untouched if it has no assigned question.
+`project_coach` only produces a combined comment when `ask_project_coach` is true and at least one tutor answer is available.
+
+## How it works
+
+1. Running `main.py` shows a console menu.
+2. Pick the topic number(s) you want to ask about (comma-separated for multiple, e.g. `1,3`).
+3. Enter your question for each selected topic.
+4. Choose `y`/`n` for whether you also want the project coach's combined comment.
+5. LangGraph invokes the selected tutor nodes in parallel, then runs `project_coach` if requested, and prints the results.
+6. Enter `q` to quit.
+
+## Usage
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/NoLucas/UP_Simple_LangGraph.git
+cd UP_Simple_LangGraph
+```
+
+### 2. Create and activate a virtual environment
+
+```bash
+python -m venv venv
+# Windows (Git Bash)
+source venv/Scripts/activate
+# macOS/Linux
+source venv/bin/activate
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Set up your API key
+
+Copy `.env.example` to `.env` and add your own Anthropic API key.
+
+```bash
+cp .env.example .env
+```
+
+```
+ANTHROPIC_API_KEY=sk-ant-your-actual-key
+```
+
+`.env` is listed in `.gitignore` and is never committed, so each user can safely use their own key.
+
+### 5. Run
+
+```bash
+python main.py
+```
+
+## Requirements
+
+- Python 3.10+
+- Anthropic API key (get one at [console.anthropic.com](https://console.anthropic.com))
+
+## Key dependencies
+
+- `langgraph` — agent graph orchestration
+- `langchain-anthropic` — Anthropic (Claude) model integration
+- `python-dotenv` — loads environment variables from `.env`
