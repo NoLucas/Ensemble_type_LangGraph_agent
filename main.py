@@ -49,6 +49,23 @@ class GraphState(TypedDict):
     project_summary: Optional[str]   # project_coach가 생성한 통합 코멘트
 
 
+def extract_text(content) -> str:
+    """
+    ChatAnthropic 응답의 content를 순수 텍스트 문자열로 변환한다.
+    extended thinking이 켜진 모델은 content가 문자열이 아니라
+    [{"type": "thinking", ...}, {"type": "text", "text": "..."}] 형태의
+    블록 리스트로 온다. 여기서 thinking 블록(추론 과정, 서명 blob)은 버리고
+    text 블록만 이어붙여야 화면에 실제 답변만 출력된다.
+    """
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
 def make_llm() -> ChatAnthropic:
     """
     호출될 때마다 새 ChatAnthropic 인스턴스를 만든다.
@@ -106,7 +123,7 @@ def java_tutor(state: GraphState) -> GraphState:
     response = llm.invoke(
         [("system", JAVA_SYSTEM_PROMPT), ("human", question)]
     )
-    return {"java_answer": response.content}
+    return {"java_answer": extract_text(response.content)}
 
 
 def oop_tutor(state: GraphState) -> GraphState:
@@ -117,7 +134,7 @@ def oop_tutor(state: GraphState) -> GraphState:
     response = llm.invoke(
         [("system", OOP_SYSTEM_PROMPT), ("human", question)]
     )
-    return {"oop_answer": response.content}
+    return {"oop_answer": extract_text(response.content)}
 
 
 def backend_db_tutor(state: GraphState) -> GraphState:
@@ -128,7 +145,7 @@ def backend_db_tutor(state: GraphState) -> GraphState:
     response = llm.invoke(
         [("system", BACKEND_DB_SYSTEM_PROMPT), ("human", question)]
     )
-    return {"backend_db_answer": response.content}
+    return {"backend_db_answer": extract_text(response.content)}
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +185,7 @@ def project_coach(state: GraphState) -> GraphState:
             ("human", "\n\n".join(collected)),
         ]
     )
-    return {"project_summary": response.content}
+    return {"project_summary": extract_text(response.content)}
 
 
 # ---------------------------------------------------------------------------
