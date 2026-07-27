@@ -26,6 +26,28 @@ java_tutor oop_tutor  backend_db_tutor      (병렬 fan-out)
 세 튜터는 병렬로 실행되며, 각 노드는 자신이 담당한 질문이 없으면 바로 통과(pass-through)합니다.
 `project_coach`는 `ask_project_coach` 값이 참이고 참고할 답변이 하나라도 있을 때만 통합 코멘트를 만듭니다.
 
+## 이 오케스트레이션의 목적
+
+Java를 배우는 사람이 한 번에 여러 영역(문법, 객체지향, 백엔드/DB)에 걸친 질문을 해도, 각 영역에
+특화된 시스템 프롬프트를 가진 튜터가 각자의 관점에서 답하도록 하는 것이 목적입니다. 하나의
+범용 프롬프트로 모든 질문에 답하게 하는 대신, 역할을 4개의 에이전트(3개의 병렬 튜터 + 1개의
+통합 코치)로 분리해 "각 에이전트는 좁고 명확한 책임만 진다"는 원칙을 실습해보는 예제입니다.
+
+## 이 구조의 장점
+
+- **관심사 분리**: 튜터마다 시스템 프롬프트(담당 범위, 설명 방식)가 독립적이라, 한 튜터의 프롬프트를
+  수정해도 다른 튜터의 답변 품질에 영향을 주지 않습니다.
+- **병렬 실행으로 인한 지연 감소**: `java_tutor`/`oop_tutor`/`backend_db_tutor`는 서로 의존성이 없으므로
+  LangGraph가 동시에 실행합니다. 세 질문을 모두 물어봐도 순차 호출(3번의 왕복 대기) 대신 가장 느린
+  튜터 1명의 응답 시간만큼만 기다리면 됩니다.
+- **불필요한 LLM 호출 생략**: 질문하지 않은 주제의 튜터는 아예 LLM을 호출하지 않고 즉시 통과하며,
+  `project_coach`도 통합 코멘트를 요청하지 않으면 실행되지 않습니다. 비용과 응답 시간을 최소화합니다.
+- **fan-in을 통한 통합 관점 제공**: `project_coach`가 세 튜터의 답변을 모아 "실전 프로젝트에 어떻게
+  적용할지"라는 상위 관점의 조언을 추가로 제공해, 단편적인 지식이 아니라 통합된 학습 경험을 만듭니다.
+- **인터페이스와 로직의 분리**: 그래프(`build_graph()`)는 `main.py`에 한 번만 정의되어 있고,
+  콘솔(`main.py`)과 웹(`app.py`) 두 인터페이스가 이를 그대로 재사용합니다. 오케스트레이션 로직을
+  건드리지 않고도 새로운 인터페이스(예: API 서버)를 추가할 수 있습니다.
+
 ## 실행 방식 두 가지
 
 이 프로젝트는 동일한 그래프(`main.py`의 `build_graph()`)를 두 가지 인터페이스로 실행할 수 있습니다.
@@ -148,6 +170,31 @@ java_tutor oop_tutor  backend_db_tutor      (parallel fan-out)
 
 The three tutors run in parallel; each node passes through untouched if it has no assigned question.
 `project_coach` only produces a combined comment when `ask_project_coach` is true and at least one tutor answer is available.
+
+## Purpose of this orchestration
+
+When a Java learner asks about multiple areas at once (syntax, OOP, backend/DB) in a single turn, each
+area is handled by a tutor agent with its own specialized system prompt, answering from its own
+perspective. Instead of one general-purpose prompt trying to answer everything, the responsibility is
+split across 4 agents (3 parallel tutors + 1 integrating coach) — a small, practical example of giving
+each agent a narrow, well-defined responsibility.
+
+## Advantages of this structure
+
+- **Separation of concerns**: each tutor's system prompt (scope, explanation style) is independent, so
+  editing one tutor's prompt doesn't affect the quality of the others' answers.
+- **Reduced latency via parallelism**: `java_tutor`, `oop_tutor`, and `backend_db_tutor` have no
+  dependency on each other, so LangGraph runs them concurrently. Asking all three topics at once only
+  costs as long as the slowest single tutor's response, instead of three sequential round trips.
+- **Fewer unnecessary LLM calls**: a tutor for a topic that wasn't asked about never calls the LLM and
+  passes through immediately; `project_coach` likewise doesn't run unless a combined comment was
+  requested. This keeps both cost and response time down.
+- **Integrated perspective via fan-in**: `project_coach` gathers all three tutors' answers and adds
+  higher-level advice on applying them to a real project, turning isolated facts into a more coherent
+  learning experience.
+- **Decoupled interface from logic**: the graph (`build_graph()`) is defined once in `main.py`, and both
+  the console (`main.py`) and web (`app.py`) interfaces reuse it as-is. A new interface (e.g. an API
+  server) can be added without touching the orchestration logic.
 
 ## Two ways to run it
 

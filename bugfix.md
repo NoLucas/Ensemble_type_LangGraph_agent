@@ -64,3 +64,29 @@ def extract_text(content) -> str:
 
 - `main.py` — `extract_text()` 추가, `java_tutor` / `oop_tutor` / `backend_db_tutor` /
   `project_coach`에서 `response.content` → `extract_text(response.content)`로 변경
+
+---
+
+# Bugfix: `max_tokens` 부족으로 답변이 중간에 잘리던 문제
+
+## 증상
+
+튜터 답변이 완결된 문장 없이 중간에 끊기거나, 코드 예시 블록이 닫히지 않은 채 출력이
+멈추는 경우가 있었다.
+
+## 원인
+
+`make_llm()`에서 `ChatAnthropic(model=MODEL_NAME, max_tokens=1024)`로 생성했는데,
+이 모델은 extended thinking을 사용하므로 응답에 포함되는 `thinking` 블록도 같은
+`max_tokens` 예산을 함께 소비한다. 즉 1024 토큰 중 상당 부분이 thinking 블록에
+쓰이고 나면, 실제 사용자에게 보여줄 `text` 블록에 남는 토큰이 부족해 답변이
+중간에 끊겼다.
+
+## 해결
+
+`max_tokens`를 `1024` → `4096`으로 늘려 thinking 블록과 실제 답변 텍스트 모두
+충분한 여유를 갖도록 했다.
+
+## 관련 파일
+
+- `main.py` — `make_llm()`의 `ChatAnthropic(..., max_tokens=1024)` → `max_tokens=4096`
