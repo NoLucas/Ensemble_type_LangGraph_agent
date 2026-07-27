@@ -73,7 +73,7 @@ def make_llm() -> ChatAnthropic:
     동시에 실행할 수 있으므로, 클라이언트 인스턴스를 전역으로 공유하지 않고
     노드마다 새로 만들어서 스레드 간 상태 공유 문제를 원천 차단한다.
     """
-    return ChatAnthropic(model=MODEL_NAME, max_tokens=1024)
+    return ChatAnthropic(model=MODEL_NAME, max_tokens=4096)
 
 
 # ---------------------------------------------------------------------------
