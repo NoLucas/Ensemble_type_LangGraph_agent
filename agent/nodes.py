@@ -95,12 +95,12 @@ def call_dispatcher_model(state: AgentState, llm) -> dict:
 
 
 def call_report_draft_model(state: AgentState, llm, system_prompt: str, label: str) -> dict:
-    """관점 하나(label)를 맡아 report_drafts에 항목 하나를 쌓는다.
+    """독립 시도 하나(label)를 맡아 report_drafts에 항목 하나를 쌓는다.
 
-    messages는 건드리지 않는다 — draft 3개가 전부 대화창에 노출되면
-    지저분해지므로, 최종 사용자 메시지는 aggregate_reports_node만 만든다.
+    messages는 건드리지 않는다 — voter 3개가 전부 대화창에 노출되면
+    지저분해지므로, 최종 사용자 메시지는 vote_for_best_report_node만 만든다.
     report_drafts는 operator.add reducer(state.py)로 누적되므로, 병렬
-    실행되는 세 draft 노드가 서로의 항목을 덮어쓰지 않는다.
+    실행되는 세 voter 노드가 서로의 항목을 덮어쓰지 않는다.
     """
     messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
     response = llm.invoke(messages)

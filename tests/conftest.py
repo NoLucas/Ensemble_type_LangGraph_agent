@@ -20,7 +20,7 @@ class FakeChatModel:
         # invoke()에 매번 어떤 messages가 들어왔는지 기록해서
         # 테스트에서 "모델이 무엇을 봤는지" 검증할 수 있게 한다.
         self.received_messages: list[list] = []
-        # 3-way 보고서 앙상블(draft_concise/detailed/action)이 같은
+        # 3-way 투표형 앙상블(voter_1/voter_2/voter_3)이 같은
         # FakeChatModel 인스턴스를 스레드 풀에서 동시에 호출하므로, calls
         # 증가와 _responses 인덱싱을 락으로 보호하지 않으면 두 스레드가
         # 같은 인덱스를 읽거나 응답을 건너뛰는 경합이 생길 수 있다.

@@ -14,12 +14,13 @@ merge 방식은 필드별로 다르게 지정할 수 있다 (Annotated[..., redu
   InvalidUpdateError), 값이 갱신되지 않는다. 델타를 더하는 방식이어야
   "LLM 호출이 총 몇 번 일어났는지"가 병렬 실행 순서와 무관하게 정확히
   합산된다.
-- report_drafts: operator.add reducer로 "누적"된다. 3개의 관점별 draft 노드가
-  병렬로 각자 하나씩 {"label": ..., "text": ...} 항목을 반환하는데, 리스트를
-  누적하는 reducer가 없으면 나중에 실행된 노드의 결과가 앞선 노드의 결과를
-  덮어써서 2개가 사라지는 버그가 생긴다. 도착 순서(=병렬 실행이 끝난 순서)는
-  보장되지 않으므로, 이 리스트를 소비하는 aggregate_reports_node는 label로
-  정렬해서 고정된 순서로 조합해야 한다.
+- report_drafts: operator.add reducer로 "누적"된다. 3개의 voter 노드가
+  같은 과제를 독립적으로 병렬 시도해 각자 하나씩 {"label": ..., "text": ...}
+  항목을 반환하는데, 리스트를 누적하는 reducer가 없으면 나중에 실행된
+  노드의 결과가 앞선 노드의 결과를 덮어써서 2개가 사라지는 버그가 생긴다.
+  도착 순서(=병렬 실행이 끝난 순서)는 보장되지 않으므로, 이 리스트를
+  소비하는 vote_for_best_report_node는 label로 candidate를 찾아 도구
+  실행 결과와의 일치 여부로 다수결 판정해야 한다.
 """
 
 import operator
