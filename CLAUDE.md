@@ -80,16 +80,16 @@ venv/Scripts/python.exe -m pip install -r requirements.txt
 
 ### 완료됨
 - GitHub 도구 2개(`fetch_repo_overview`/`fetch_repo_source_sample`) + 팬아웃/팬인, 정상/실패(저장소 없음·rate limit·네트워크 오류) 케이스 전부 테스트 포함
-- 투표형 앙상블(voter × 3 + 결정론적 다수결)을 리뷰(요약+코드 리뷰) 프롬프트로 재구성, 42개 테스트 통과
+- 투표형 앙상블(voter × 3 + 결정론적 다수결)을 리뷰(요약+코드 리뷰) 프롬프트로 재구성, 42개 단위/통합(FakeChatModel) 테스트 통과
 - 콘솔(`main.py`) / Streamlit(`app.py`) / Chainlit(`chainlit_app.py`) 진입점을 새 목적에 맞게 텍스트/라벨 갱신
 - 기존 계산/파일 도구(`calculate`/`read_sandbox_file`/`write_sandbox_file`)와 관련 테스트·`sandbox_data/` 완전 제거
+- **실LLM 통합 테스트(`tests/test_integration.py`) 작성 및 실제 API 키로 통과 확인**: `claude-haiku-4-5-20251001` + 실제 GitHub API(`octocat/Hello-World`)로 (1) dispatcher가 대화에서 `owner/repo`를 정확히 도구 인자로 추출하는지, (2) 전체 파이프라인이 voter 3개를 채우고 최종 리뷰를 만들어내는지 검증. `integration` 마커라 기본 `pytest`/CI에서는 제외되고, `ANTHROPIC_API_KEY`가 없으면 실패 대신 skip된다.
 
 ### 아직 안 된 것 / 알려진 한계
 - **체크포인터(SqliteSaver) 미지원**: `agent/graph.py`의 `build_graph()`가 `checkpointer` 파라미터를 받지 않는다.
-- **실LLM 통합 테스트 없음**: `tests/test_integration.py`가 없다. 실제 `ANTHROPIC_API_KEY`로 dispatcher가 실제로 `owner/repo`를 도구 인자로 잘 추출하는지 확인해본 적 없음.
 - **GitHub 비인증 rate limit**: 시간당 60회라 여러 저장소를 짧은 시간에 반복 리뷰하는 시나리오는 취약하다. 필요해지면 토큰 인증으로 전환.
-- **투표 로직이 단순 문자열 포함 검사**: `vote_for_best_report_node`가 숫자/표현 차이(예: stars 수를 "42"가 아니라 "마흔두 개"로 표현)에는 관대하지 않다. 저장소 리뷰는 계산 결과보다 텍스트가 길고 자유도가 높아서, 이 문자열 포함 검사가 계산기 버전만큼 정밀하게 승자를 가리지 못할 가능성이 있다 — 실제 LLM으로 써보면서 재점검 필요.
-- **CI(`.github/workflows/tests.yml`)가 새 테스트 스위트로 통과하는지 로컬에서만 확인함**: 실제 GitHub Actions 실행 로그는 아직 못 봤다(이 세션에서 push까지는 안 함).
+- **투표 로직이 단순 문자열 포함 검사**: `vote_for_best_report_node`가 숫자/표현 차이(예: stars 수를 "42"가 아니라 "마흔두 개"로 표현)에는 관대하지 않다. 실LLM 통합 테스트가 구조(voter 3개 채워짐, 최종 답변에 저장소명 포함)까지는 확인했지만, "다수결이 항상 가장 정확한 draft를 고르는지"까지는 검증하지 않는다.
+- **CI(`.github/workflows/tests.yml`)가 새 테스트 스위트로 통과하는지 로컬에서만 확인함**: 실제 GitHub Actions 실행 로그는 아직 못 봤다. `test_integration.py`는 `integration` 마커라 CI(`pytest -m "not integration"`)에서는 애초에 실행되지 않는다.
 
 ## 관련 문서
 - [README.md](README.md) — 사용자 대상 설명 (구조, 도구, 설치법)

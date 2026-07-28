@@ -75,12 +75,18 @@ pip install -r requirements.txt
 pytest
 ```
 
-현재 42개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD).
+현재 44개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD + 실LLM 통합 테스트 2개).
 
-느린 테스트(실LLM 호출)는 `integration` 마커로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
+느린 테스트(실LLM + 실제 GitHub API 호출)는 `integration` 마커(`tests/test_integration.py`)로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
 
 ```bash
 pytest -m "not integration"
+```
+
+`test_integration.py`는 `.env`의 `ANTHROPIC_API_KEY`가 설정된 경우에만 실행되고, 없으면 실패하지 않고 자동으로 skip됩니다. 키가 있는 상태에서 통합 테스트만 따로 돌리려면:
+
+```bash
+pytest -m integration
 ```
 
 `tests/conftest.py`의 `FakeChatModel`은 `threading.Lock`으로 `invoke()`를 보호합니다 — voter 3개가 그래프 실행 중 같은 `FakeChatModel` 인스턴스를 스레드 풀에서 동시에 호출하므로, 락이 없으면 `calls` 증가와 응답 인덱싱이 경합해 테스트가 간헐적으로 실패할 수 있습니다. `mock_github_get`(`QueuedGet`)은 `requests.get`을 호출 순서 기반 더미로 교체해 실제 GitHub API를 타지 않고 도구 로직을 검증합니다.
