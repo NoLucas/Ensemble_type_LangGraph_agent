@@ -108,3 +108,71 @@ return {
 - `agent/nodes.py` — `call_dispatcher_model`/`call_report_draft_model`이 절대값 대신
   델타(1)를 반환하도록 수정
 - `tests/test_nodes.py` — 관련 단위 테스트를 델타 기준으로 갱신
+
+---
+
+# Bugfix 아님 — GitHub 도구 전환 시 미리 방어한 실패 케이스
+
+계산/파일 도구를 `fetch_repo_overview`/`fetch_repo_source_sample`(GitHub REST API)로
+교체하면서, 실제로 겪은 버그는 아니지만 **외부 API를 호출하는 도구라서 반드시 처음부터
+막아둬야 했던 실패 케이스**를 정리해둔다. 이전 도구(calculate/read/write)는 실패 원인이
+전부 로컬(잘못된 표현식, 경로 탈출)이었지만, 이번 도구는 실패 원인이 로컬(잘못된 repo
+형식)과 원격(GitHub 쪽 상태)에 걸쳐 있어서 각각 다른 방어가 필요했다.
+
+## 1. `owner/repo` 형식이 아닌 입력
+
+LLM이 저장소를 `https://github.com/owner/repo` 전체 URL이나 `owner`만, 또는 완전히
+관련 없는 문자열로 넘길 수 있다. 이 경우 GitHub API에 요청 자체를 보내지 않고
+`_validate_repo()`(정규식 `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)에서 즉시
+`"Error: 저장소는 'owner/repo' 형식이어야 합니다"`로 걸러낸다. 불필요한 API 호출(=
+비인증 rate limit 소모)을 막는 것도 이 검증의 목적이다.
+
+## 2. 저장소가 존재하지 않음 (404)
+
+오타가 있는 저장소명이나 삭제된 저장소를 리뷰해달라고 하면 `/repos/{repo}`가 404를
+반환한다. `_fetch_repo_metadata()`가 상태 코드를 보고 `f"Error: 저장소를 찾을 수
+없습니다 ({repo})."`를 반환하며, 이후 README/트리/파일 조회로 넘어가지 않는다(연쇄
+실패를 막기 위해 초반에 조기 반환).
+
+## 3. 비인증 GitHub API rate limit 초과 (403)
+
+의도적으로 비인증 호출을 선택했기 때문에(시간당 60회), 저장소를 몇 개만 연속으로
+리뷰해도 한도를 넘기기 쉽다. 403을 다른 종류의 실패(404, 5xx)와 구분해서
+`"Error: GitHub API 요청 한도를 초과했습니다 (비인증 시 시간당 60회)."`로 원인을
+명시했다 — 단순히 "요청 실패"라고만 하면 사용자가 저장소명이 잘못됐다고 오해하기
+쉽기 때문이다.
+
+## 4. README가 없는 저장소
+
+메타데이터 조회는 성공했지만 `/repos/{repo}/readme`가 404인 경우(README 파일이 없는
+저장소는 흔하다), 전체 개요 조회를 실패로 처리하지 않고 `(README 없음)` 문구만 붙여서
+나머지 메타데이터(설명/언어/stars 등)는 그대로 반환한다. README 하나가 없다고 저장소
+개요 전체를 못 가져오는 것은 과도한 실패 처리라고 판단했다.
+
+## 5. 코드 리뷰 대상 소스 파일이 하나도 없는 저장소
+
+문서 전용 저장소, 데이터셋 저장소, 또는 확장자가 화이트리스트(`_SOURCE_EXTENSIONS`)에
+없는 언어로만 이루어진 저장소는 트리 조회는 성공해도 `candidates`가 빈 리스트가 된다.
+이 경우 `Error`가 아니라 `f"({repo}에서 리뷰할 소스 파일을 찾지 못했습니다.)"`를
+반환한다 — "실패"가 아니라 "리뷰할 코드가 없다는 사실 자체가 결과"이므로,
+`vote_for_best_report_node`가 이 문자열을 정답(ToolMessage)으로 놓고 다수결을 매길
+때도 동일하게 취급된다.
+
+## 6. 네트워크 오류(타임아웃/연결 실패)
+
+`requests.get()`이 `requests.RequestException`을 던질 수 있으므로(DNS 실패, 타임아웃
+등), 모든 호출을 개별 `try/except`로 감싸 `f"Error: ... 실패했습니다 ({exc})"` 형태로
+변환한다. 특히 `fetch_repo_source_sample_text`는 선택된 파일 여러 개를 순차적으로
+가져오는데, 파일 하나가 네트워크 오류로 실패해도 나머지 파일 조회를 계속 진행하고
+해당 파일 섹션에만 실패 메시지를 남긴다(전체를 포기하지 않는다).
+
+이 다섯/여섯 케이스 모두 `tests/test_tools.py`에 `mock_github_get`(conftest.py의
+`QueuedGet`)으로 각각 대응하는 테스트가 있다. 실제 GitHub API를 타지 않고도 상태
+코드만 조작해서 결정적으로 재현할 수 있다.
+
+## 관련 파일
+
+- `agent/tools.py` — `_validate_repo`, `_fetch_repo_metadata`,
+  `fetch_repo_overview_text`, `fetch_repo_source_sample_text`
+- `tests/test_tools.py` — 케이스별 정상/실패 테스트
+- `tests/conftest.py` — `FakeResponse`/`QueuedGet` (requests.get 모킹)
