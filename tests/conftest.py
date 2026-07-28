@@ -54,9 +54,43 @@ def fake_llm_factory():
     return _make
 
 
+class FakeResponse:
+    """requests.Response를 흉내 내는 최소한의 더미(status_code/json/text만)."""
+
+    def __init__(self, status_code=200, json_data=None, text=""):
+        self.status_code = status_code
+        self._json_data = json_data if json_data is not None else {}
+        self.text = text
+
+    def json(self):
+        return self._json_data
+
+
+class QueuedGet:
+    """requests.get을 대체하는 더미. 호출될 때마다 큐에서 응답을 하나씩 꺼내
+    반환한다. GitHub 도구가 여러 번(메타데이터 -> README/트리 -> 파일 내용)
+    순차적으로 requests.get을 호출하므로, URL 매칭 대신 호출 순서로 응답을
+    미리 정해두는 편이 테스트를 단순하게 만든다."""
+
+    def __init__(self, responses: list):
+        self._responses = list(responses)
+        self.calls: list[tuple] = []
+
+    def __call__(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if not self._responses:
+            raise AssertionError("QueuedGet: 예정된 응답을 모두 소진했습니다.")
+        return self._responses.pop(0)
+
+
 @pytest.fixture
-def sandbox_dir(tmp_path):
-    """read_text_file 도구가 접근할 수 있는 격리된 샌드박스 디렉토리."""
-    d = tmp_path / "sandbox"
-    d.mkdir()
-    return d
+def mock_github_get(monkeypatch):
+    """agent.tools.requests.get을 QueuedGet으로 교체하는 팩토리 픽스처."""
+    import agent.tools as tools_module
+
+    def _install(responses: list) -> QueuedGet:
+        fake = QueuedGet(responses)
+        monkeypatch.setattr(tools_module.requests, "get", fake)
+        return fake
+
+    return _install

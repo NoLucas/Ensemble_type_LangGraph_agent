@@ -1,13 +1,13 @@
 """
 그래프 통합(E2E) 테스트.
 
-실제 도구(calculate, read_text_file, write_text_file)와 FakeChatModel을
-결합해서 그래프 전체가
-dispatcher -> [calculate_node, read_file_node, write_file_node] (도구
-팬아웃) -> [voter_1, voter_2, voter_3] (투표형 앙상블 팬아웃) ->
+실제 도구(fetch_repo_overview, fetch_repo_source_sample)와 FakeChatModel을
+결합해서 그래프 전체가 dispatcher -> [repo_overview_node, repo_source_node]
+(도구 팬아웃) -> [voter_1, voter_2, voter_3] (투표형 앙상블 팬아웃) ->
 vote_for_best_report -> END 순서로 정상 동작하는지 검증한다. LLM 자체는
-가짜지만, 도구 실행과 상태 병합(add_messages/operator.add reducer)은 실제
-코드 경로를 그대로 탄다.
+가짜지만, GitHub API는 mock_github_get(conftest.py)으로 대체하고, 도구
+실행과 상태 병합(add_messages/operator.add reducer)은 실제 코드 경로를
+그대로 탄다.
 
 가장 중요한 두 케이스:
 1. test_graph_votes_for_the_candidate_that_matches_tool_facts — 세 voter가
@@ -24,135 +24,142 @@ vote_for_best_report -> END 순서로 정상 동작하는지 검증한다. LLM �
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agent.graph import build_graph
+from tests.conftest import FakeResponse
 
 
-def test_graph_dispatches_calculate_then_votes_for_report(fake_llm_factory):
+def test_graph_dispatches_overview_then_votes_for_report(fake_llm_factory, mock_github_get):
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"full_name": "octocat/hello-world", "stargazers_count": 42}),
+            FakeResponse(200, text="README"),
+        ]
+    )
     responses = [
         AIMessage(
             content="",
-            tool_calls=[{"name": "calculate", "args": {"expression": "2+2"}, "id": "call_1"}],
+            tool_calls=[
+                {"name": "fetch_repo_overview", "args": {"repo": "octocat/hello-world"}, "id": "call_1"}
+            ],
         ),
-        AIMessage(content="계산 결과는 4입니다."),
-        AIMessage(content="계산 결과는 4입니다."),
-        AIMessage(content="계산 결과는 4입니다."),
+        AIMessage(content="이 저장소는 stars: 42를 받았습니다."),
+        AIMessage(content="이 저장소는 stars: 42를 받았습니다."),
+        AIMessage(content="이 저장소는 stars: 42를 받았습니다."),
     ]
     llm = fake_llm_factory(responses)
     graph = build_graph(llm)
 
     result = graph.invoke(
-        {"messages": [HumanMessage(content="2+2는 얼마야?")], "iteration": 0, "report_drafts": []}
-    )
-
-    assert result["messages"][-1].content == "계산 결과는 4입니다."
-    assert llm.calls == 4  # dispatcher 1 + voter 3
-    assert result["iteration"] == 4
-    tool_messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]
-    assert len(tool_messages) == 1
-    assert tool_messages[0].content == "4"
-
-
-def test_graph_votes_for_the_candidate_that_matches_tool_facts(fake_llm_factory, sandbox_dir):
-    (sandbox_dir / "sales.txt").write_text("1200", encoding="utf-8")
-    responses = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {"name": "read_sandbox_file", "args": {"filename": "sales.txt"}, "id": "call_1"}
-            ],
-        ),
-        # 세 voter의 독립 시도. voter_1만 실제 도구 결과("1200")를 정확히
-        # 반영했고, 나머지 둘은 사실을 언급하지 못했다(환각/회피).
-        AIMessage(content="매출은 1200입니다."),
-        AIMessage(content="죄송하지만 파일 내용을 확인하지 못했습니다."),
-        AIMessage(content="아마 매출 관련 파일인 것 같습니다."),
-    ]
-    llm = fake_llm_factory(responses)
-    graph = build_graph(llm, sandbox_dir=sandbox_dir)
-
-    result = graph.invoke(
-        {"messages": [HumanMessage(content="sales.txt 내용 알려줘")], "iteration": 0, "report_drafts": []}
-    )
-
-    # 세 voter 중 사실("1200")을 실제로 담은 답만 최종 답변으로 채택돼야 한다.
-    assert result["messages"][-1].content == "매출은 1200입니다."
-    assert len(result["report_drafts"]) == 3
-
-
-def test_graph_dispatches_write_then_votes_for_report(fake_llm_factory, sandbox_dir):
-    responses = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "write_sandbox_file",
-                    "args": {"filename": "note.txt", "content": "저장된 메모"},
-                    "id": "call_1",
-                }
-            ],
-        ),
-        AIMessage(content="OK: note.txt에 저장을 완료했습니다."),
-        AIMessage(content="OK: note.txt에 저장을 완료했습니다."),
-        AIMessage(content="OK: note.txt에 저장을 완료했습니다."),
-    ]
-    llm = fake_llm_factory(responses)
-    graph = build_graph(llm, sandbox_dir=sandbox_dir)
-
-    result = graph.invoke(
-        {"messages": [HumanMessage(content="메모 저장해줘")], "iteration": 0, "report_drafts": []}
-    )
-
-    assert "저장" in result["messages"][-1].content
-    assert (sandbox_dir / "note.txt").read_text(encoding="utf-8") == "저장된 메모"
-
-
-def test_graph_fans_out_tools_then_fans_out_three_voters(fake_llm_factory, sandbox_dir):
-    (sandbox_dir / "sales.txt").write_text("1200", encoding="utf-8")
-    responses = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {"name": "calculate", "args": {"expression": "2+2"}, "id": "call_calc"},
-                {
-                    "name": "read_sandbox_file",
-                    "args": {"filename": "sales.txt"},
-                    "id": "call_read",
-                },
-                {
-                    "name": "write_sandbox_file",
-                    "args": {"filename": "result.txt", "content": "4"},
-                    "id": "call_write",
-                },
-            ],
-        ),
-        AIMessage(content="계산 4, 매출 1200, result.txt 저장 완료: OK"),
-        AIMessage(content="계산 4, 매출 1200, result.txt 저장 완료: OK"),
-        AIMessage(content="계산 4, 매출 1200, result.txt 저장 완료: OK"),
-    ]
-    llm = fake_llm_factory(responses)
-    graph = build_graph(llm, sandbox_dir=sandbox_dir)
-
-    result = graph.invoke(
         {
-            "messages": [HumanMessage(content="계산하고 파일도 읽고 결과도 저장해줘")],
+            "messages": [HumanMessage(content="octocat/hello-world 리뷰해줘")],
             "iteration": 0,
             "report_drafts": [],
         }
     )
 
-    # dispatcher 1번 + voter 3번 = 정확히 4번. 도구 3개와 voter 3개 모두
+    assert result["messages"][-1].content == "이 저장소는 stars: 42를 받았습니다."
+    assert llm.calls == 4  # dispatcher 1 + voter 3
+    assert result["iteration"] == 4
+    tool_messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+    assert len(tool_messages) == 1
+    assert "stargazers_count" not in tool_messages[0].content  # 원본 JSON이 아니라 정리된 텍스트
+
+
+def test_graph_votes_for_the_candidate_that_matches_tool_facts(fake_llm_factory, mock_github_get):
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main"}),
+            FakeResponse(200, json_data={"tree": [{"path": "main.py", "type": "blob"}]}),
+            FakeResponse(200, text="def main(): pass"),
+        ]
+    )
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "fetch_repo_source_sample",
+                    "args": {"repo": "octocat/hello-world"},
+                    "id": "call_1",
+                }
+            ],
+        ),
+        # 세 voter의 독립 시도. voter_1만 실제 도구 결과("def main")를 정확히
+        # 반영했고, 나머지 둘은 사실을 언급하지 못했다(환각/회피).
+        AIMessage(content="main.py에는 def main(): pass 코드가 있습니다."),
+        AIMessage(content="죄송하지만 소스 코드를 확인하지 못했습니다."),
+        AIMessage(content="아마 진입점 파일인 것 같습니다."),
+    ]
+    llm = fake_llm_factory(responses)
+    graph = build_graph(llm)
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="octocat/hello-world 코드 리뷰해줘")],
+            "iteration": 0,
+            "report_drafts": [],
+        }
+    )
+
+    # 세 voter 중 사실("def main(): pass")을 실제로 담은 답만 최종 답변으로 채택돼야 한다.
+    assert result["messages"][-1].content == "main.py에는 def main(): pass 코드가 있습니다."
+    assert len(result["report_drafts"]) == 3
+
+
+def test_graph_fans_out_both_tools_then_fans_out_three_voters(fake_llm_factory, mock_github_get):
+    mock_github_get(
+        [
+            # repo_overview_node
+            FakeResponse(200, json_data={"full_name": "octocat/hello-world", "stargazers_count": 42}),
+            FakeResponse(200, text="README"),
+            # repo_source_node
+            FakeResponse(200, json_data={"default_branch": "main"}),
+            FakeResponse(200, json_data={"tree": [{"path": "main.py", "type": "blob"}]}),
+            FakeResponse(200, text="def main(): pass"),
+        ]
+    )
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "fetch_repo_overview",
+                    "args": {"repo": "octocat/hello-world"},
+                    "id": "call_overview",
+                },
+                {
+                    "name": "fetch_repo_source_sample",
+                    "args": {"repo": "octocat/hello-world"},
+                    "id": "call_source",
+                },
+            ],
+        ),
+        AIMessage(content="요약: stars 42. 코드 리뷰: def main(): pass"),
+        AIMessage(content="요약: stars 42. 코드 리뷰: def main(): pass"),
+        AIMessage(content="요약: stars 42. 코드 리뷰: def main(): pass"),
+    ]
+    llm = fake_llm_factory(responses)
+    graph = build_graph(llm)
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="octocat/hello-world 요약이랑 코드 리뷰 둘 다 해줘")],
+            "iteration": 0,
+            "report_drafts": [],
+        }
+    )
+
+    # dispatcher 1번 + voter 3번 = 정확히 4번. 도구 2개와 voter 3개 모두
     # 순차가 아니라 각자의 라운드에서 병렬로 처리됐다는 증거다.
     assert llm.calls == 4
     assert result["iteration"] == 4
     assert len(result["report_drafts"]) == 3
 
     tool_messages = {m.tool_call_id: m.content for m in result["messages"] if isinstance(m, ToolMessage)}
-    assert tool_messages["call_calc"] == "4"
-    assert tool_messages["call_read"] == "1200"
-    assert tool_messages["call_write"].startswith("OK")
-    assert (sandbox_dir / "result.txt").read_text(encoding="utf-8") == "4"
+    assert "octocat/hello-world" in tool_messages["call_overview"]
+    assert "def main(): pass" in tool_messages["call_source"]
 
     final_text = result["messages"][-1].content
-    assert "4" in final_text and "1200" in final_text
+    assert "stars" in final_text and "def main" in final_text
 
 
 def test_graph_skips_voting_when_no_tools_needed(fake_llm_factory):
@@ -172,28 +179,42 @@ def test_graph_skips_voting_when_no_tools_needed(fake_llm_factory):
     assert result.get("report_drafts", []) == []
 
 
-def test_graph_ignores_tool_calls_returned_by_voter_node(fake_llm_factory):
+def test_graph_ignores_tool_calls_returned_by_voter_node(fake_llm_factory, mock_github_get):
     # voter 노드가 (실수로든 뭐든) tool_call이 섞인 응답을 내더라도, voter ->
     # vote_for_best_report -> END는 모두 무조건 엣지라 그래프가 그 tool_call을
     # 절대 실행하지 않는다. 안전장치가 "프롬프트를 잘 따르길 바란다"가 아니라
     # 그래프 구조(고정 엣지 + bind_tools 안 된 llm) 자체임을 보여주는 테스트다.
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"full_name": "octocat/hello-world"}),
+            FakeResponse(200, text="README"),
+        ]
+    )
     responses = [
         AIMessage(
             content="",
-            tool_calls=[{"name": "calculate", "args": {"expression": "1+1"}, "id": "call_1"}],
+            tool_calls=[
+                {"name": "fetch_repo_overview", "args": {"repo": "octocat/hello-world"}, "id": "call_1"}
+            ],
         ),
         AIMessage(
-            content="정답은 2입니다.",
-            tool_calls=[{"name": "calculate", "args": {"expression": "9+9"}, "id": "call_2"}],
+            content="정답은 이것입니다.",
+            tool_calls=[
+                {"name": "fetch_repo_overview", "args": {"repo": "other/repo"}, "id": "call_2"}
+            ],
         ),
-        AIMessage(content="정답은 2입니다."),
-        AIMessage(content="정답은 2입니다."),
+        AIMessage(content="정답은 이것입니다."),
+        AIMessage(content="정답은 이것입니다."),
     ]
     llm = fake_llm_factory(responses)
     graph = build_graph(llm)
 
     result = graph.invoke(
-        {"messages": [HumanMessage(content="1+1 계산해줘")], "iteration": 0, "report_drafts": []}
+        {
+            "messages": [HumanMessage(content="octocat/hello-world 리뷰해줘")],
+            "iteration": 0,
+            "report_drafts": [],
+        }
     )
 
     # voter 단계 이후 추가 라운드가 없으므로 llm은 정확히 4번만 호출된다.

@@ -1,5 +1,5 @@
 """
-코드/데이터 작업 에이전트 - Chainlit 웹 인터페이스.
+GitHub 저장소 리뷰 에이전트 - Chainlit 웹 인터페이스.
 
 main.py의 make_llm()/extract_text()를 그대로 재사용한다. 오케스트레이션
 로직(build_graph)은 agent/ 패키지에만 있고, 이 파일은 그걸 Chainlit 채팅
@@ -7,8 +7,8 @@ UI로 보여주는 인터페이스일 뿐이다.
 
 app.py(Streamlit)와의 차이는 도구 실행 과정을 보여주는 방식이다: 여기서는
 graph.invoke() 대신 graph.stream(..., stream_mode="updates")로 그래프를
-한 번만 실행하면서, 도구 노드(calculate_node/read_file_node/write_file_node)
-가 반환한 결과를 cl.Step으로 실시간 시각화한다. invoke()와 stream()을 각각
+한 번만 실행하면서, 도구 노드(repo_overview_node/repo_source_node)가
+반환한 결과를 cl.Step으로 실시간 시각화한다. invoke()와 stream()을 각각
 호출하면 그래프가 두 번 실행되어 LLM 호출 비용이 두 배가 되므로, stream()
 결과만으로 최종 상태를 직접 재구성한다(_merge_update).
 """
@@ -22,9 +22,8 @@ from main import extract_text, make_llm
 # 도구 노드 이름 -> Step에 표시할 라벨. agent/nodes.py의 FANOUT_TOOL_NODES와
 # 짝이 맞아야 한다.
 TOOL_STEP_LABELS = {
-    "calculate_node": "🧮 계산",
-    "read_file_node": "📖 파일 읽기",
-    "write_file_node": "✍️ 파일 쓰기",
+    "repo_overview_node": "📋 저장소 개요",
+    "repo_source_node": "🔍 소스 코드 발췌",
 }
 
 _graph = None
@@ -66,8 +65,9 @@ async def on_chat_start():
     cl.user_session.set("agent_state", {"messages": [], "iteration": 0, "report_drafts": []})
     await cl.Message(
         content=(
-            "🛠️ 코드/데이터 작업 에이전트입니다.\n\n"
-            "계산(예: `23*17 계산해줘`), 샌드박스 파일 읽기/쓰기를 요청해보세요."
+            "🔎 GitHub 저장소 리뷰 에이전트입니다.\n\n"
+            "리뷰할 저장소를 owner/repo 형식으로 알려주세요 "
+            "(예: `langchain-ai/langgraph 리뷰해줘`)."
         )
     ).send()
 

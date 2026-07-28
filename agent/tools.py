@@ -1,132 +1,167 @@
 """
 에이전트가 사용할 도구(tool) 모음.
 
-두 가지 원칙을 지킨다:
-1. eval()/exec()로 임의 코드를 실행하지 않는다. calculate는 ast를 직접 순회하며
-   허용된 연산자(+ - * / 단항부호, 괄호)만 계산하는 화이트리스트 방식이다.
-2. 파일 접근은 지정된 base_dir 밖으로 절대 나갈 수 없다. "../" 상대경로 탈출과
-   절대경로 지정을 모두 resolve() 후 base_dir 하위인지 검사해서 막는다.
+GitHub 공개 REST API(비인증, 시간당 60회 제한)만 사용해서 두 도구를 제공한다:
+1. fetch_repo_overview: 저장소 메타데이터(설명/언어/스타 수)와 README 발췌.
+   "요약 리포트"의 재료가 된다.
+2. fetch_repo_source_sample: 저장소 트리에서 대표 소스 파일 몇 개를 골라
+   내용을 가져온다. "코드 리뷰"의 재료가 된다.
 
-도구는 예외를 던지지 않고 "Error: ..." 문자열을 반환한다. 그래프 안에서
+두 도구 모두 예외를 던지지 않고 "Error: ..." 문자열을 반환한다. 그래프 안에서
 ToolNode가 도구를 호출하는데, 여기서 예외가 새면 그래프 실행 전체가 죽기
-때문에 실패도 반드시 정상적인 반환값으로 표현해야 한다.
+때문에 실패(저장소 없음, rate limit, 네트워크 오류)도 반드시 정상적인
+반환값으로 표현해야 한다.
 """
 
-import ast
-import operator
+import re
 from pathlib import Path
 
+import requests
 from langchain_core.tools import tool
 
-# calculate가 허용하는 연산자만 화이트리스트로 등록한다.
-# 여기 없는 ast 노드(Call, Name, Attribute 등)는 전부 거부된다.
-_ALLOWED_BINOPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
+GITHUB_API_BASE = "https://api.github.com"
+_REQUEST_TIMEOUT = 10
+
+# "owner/repo" 형식만 허용한다. LLM이 URL 전체나 잘못된 문자열을 넘길 수
+# 있으므로, API를 호출하기 전에 걸러낸다.
+_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+# 코드 리뷰 대상으로 삼을 확장자 화이트리스트. 설정/데이터 파일은 제외한다.
+_SOURCE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs",
+    ".java", ".kt", ".rb", ".c", ".cpp", ".cs",
 }
-_ALLOWED_UNARYOPS = {
-    ast.UAdd: operator.pos,
-    ast.USub: operator.neg,
-}
+# 테스트/벤더/빌드 산출물 경로는 "저장소의 진짜 코드"가 아니므로 후보에서 뺀다.
+_SKIP_PATH_PARTS = {"test", "tests", "vendor", "node_modules", "dist", "build", ".github"}
+
+_MAX_README_CHARS = 3000
+_MAX_SOURCE_FILES = 3
+_MAX_FILE_CHARS = 1500
 
 
-def _eval_ast_node(node: ast.AST):
-    if isinstance(node, ast.Expression):
-        return _eval_ast_node(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-        left = _eval_ast_node(node.left)
-        right = _eval_ast_node(node.right)
-        return _ALLOWED_BINOPS[type(node.op)](left, right)
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
-        operand = _eval_ast_node(node.operand)
-        return _ALLOWED_UNARYOPS[type(node.op)](operand)
-    raise ValueError(f"허용되지 않은 표현식입니다: {ast.dump(node)}")
+def _validate_repo(repo: str) -> str | None:
+    """repo가 'owner/repo' 형식이 아니면 에러 문자열을, 맞으면 None을 반환한다."""
+    if not repo or not _REPO_PATTERN.match(repo):
+        return f"Error: 저장소는 'owner/repo' 형식이어야 합니다 ({repo!r})."
+    return None
 
 
-def _format_number(value: float | int) -> str:
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value)
+def _fetch_repo_metadata(repo: str):
+    """저장소 메타데이터를 가져온다. 성공 시 (dict, None), 실패 시 (None, 에러문자열)."""
+    try:
+        response = requests.get(f"{GITHUB_API_BASE}/repos/{repo}", timeout=_REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        return None, f"Error: GitHub API 요청에 실패했습니다 ({exc})"
+
+    if response.status_code == 404:
+        return None, f"Error: 저장소를 찾을 수 없습니다 ({repo})."
+    if response.status_code == 403:
+        return None, "Error: GitHub API 요청 한도를 초과했습니다 (비인증 시 시간당 60회)."
+    if response.status_code != 200:
+        return None, f"Error: GitHub API가 예상치 못한 응답을 반환했습니다 (status={response.status_code})."
+    return response.json(), None
+
+
+def fetch_repo_overview_text(repo: str) -> str:
+    """저장소 메타데이터 + README 발췌를 사람이 읽을 텍스트로 조립한다."""
+    invalid = _validate_repo(repo)
+    if invalid:
+        return invalid
+
+    meta, error = _fetch_repo_metadata(repo)
+    if error:
+        return error
+
+    lines = [
+        f"# {meta.get('full_name', repo)}",
+        f"설명: {meta.get('description') or '(없음)'}",
+        f"언어: {meta.get('language') or '(알 수 없음)'}",
+        f"stars: {meta.get('stargazers_count', 0)}, forks: {meta.get('forks_count', 0)}",
+        f"토픽: {', '.join(meta.get('topics') or []) or '(없음)'}",
+    ]
+
+    try:
+        readme_response = requests.get(
+            f"{GITHUB_API_BASE}/repos/{repo}/readme",
+            headers={"Accept": "application/vnd.github.v3.raw"},
+            timeout=_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        lines.append("\n(README를 가져오지 못했습니다.)")
+        return "\n".join(lines)
+
+    if readme_response.status_code == 200:
+        lines.append("\n## README 발췌\n" + readme_response.text[:_MAX_README_CHARS])
+    else:
+        lines.append("\n(README 없음)")
+
+    return "\n".join(lines)
+
+
+def fetch_repo_source_sample_text(repo: str) -> str:
+    """저장소 트리에서 대표 소스 파일 몇 개를 골라 내용을 이어붙인다."""
+    invalid = _validate_repo(repo)
+    if invalid:
+        return invalid
+
+    meta, error = _fetch_repo_metadata(repo)
+    if error:
+        return error
+    default_branch = meta.get("default_branch") or "main"
+
+    try:
+        tree_response = requests.get(
+            f"{GITHUB_API_BASE}/repos/{repo}/git/trees/{default_branch}",
+            params={"recursive": "1"},
+            timeout=_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return f"Error: 파일 목록을 가져오지 못했습니다 ({exc})"
+    if tree_response.status_code != 200:
+        return f"Error: 파일 목록을 가져오지 못했습니다 (status={tree_response.status_code})."
+
+    candidates = [
+        item["path"]
+        for item in tree_response.json().get("tree", [])
+        if item.get("type") == "blob"
+        and Path(item["path"]).suffix in _SOURCE_EXTENSIONS
+        and not (_SKIP_PATH_PARTS & set(Path(item["path"]).parts))
+    ]
+    # 경로 깊이가 얕은(=저장소의 핵심에 가까운) 파일부터, 동률이면 이름순으로.
+    candidates.sort(key=lambda p: (p.count("/"), p))
+    selected = candidates[:_MAX_SOURCE_FILES]
+
+    if not selected:
+        return f"({repo}에서 리뷰할 소스 파일을 찾지 못했습니다.)"
+
+    sections = []
+    for path in selected:
+        try:
+            file_response = requests.get(
+                f"{GITHUB_API_BASE}/repos/{repo}/contents/{path}",
+                headers={"Accept": "application/vnd.github.v3.raw"},
+                timeout=_REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            sections.append(f"### {path}\n(가져오기 실패: {exc})")
+            continue
+        if file_response.status_code != 200:
+            sections.append(f"### {path}\n(가져오기 실패: status={file_response.status_code})")
+            continue
+        sections.append(f"### {path}\n```\n{file_response.text[:_MAX_FILE_CHARS]}\n```")
+
+    return "\n\n".join(sections)
 
 
 @tool
-def calculate(expression: str) -> str:
-    """사칙연산(+, -, *, /)과 괄호로 이루어진 산술식을 계산한다.
-    변수, 함수 호출, import 등은 지원하지 않으며 순수 숫자 계산에만 사용한다.
-    """
-    try:
-        parsed = ast.parse(expression, mode="eval")
-        result = _eval_ast_node(parsed)
-    except ZeroDivisionError:
-        return "Error: 0으로 나눌 수 없습니다."
-    except (SyntaxError, ValueError, TypeError) as exc:
-        return f"Error: 계산할 수 없는 표현식입니다 ({exc})"
-    return _format_number(result)
+def fetch_repo_overview(repo: str) -> str:
+    """GitHub 저장소의 메타데이터(설명/언어/스타 수)와 README 발췌를 가져온다.
+    repo는 'owner/repo' 형식이어야 한다 (예: 'langchain-ai/langgraph')."""
+    return fetch_repo_overview_text(repo)
 
 
-def read_text_file(filename: str, base_dir: Path) -> str:
-    """base_dir 하위의 텍스트 파일만 읽는다. 경로 탈출은 전부 거부한다."""
-    base_dir = Path(base_dir).resolve()
-    target = (base_dir / filename).resolve()
-
-    if base_dir not in target.parents and target != base_dir:
-        return "Error: 허용된 디렉토리 밖의 경로는 읽을 수 없습니다."
-    if not target.is_file():
-        return f"Error: 파일을 찾을 수 없습니다 ({filename})."
-
-    try:
-        return target.read_text(encoding="utf-8")
-    except OSError as exc:
-        return f"Error: 파일을 읽는 중 오류가 발생했습니다 ({exc})"
-
-
-def write_text_file(filename: str, content: str, base_dir: Path) -> str:
-    """base_dir 하위에만 텍스트 파일을 쓴다. 경로 탈출은 전부 거부한다.
-
-    read_text_file과 동일한 경계 검사(resolve() 후 base_dir 하위인지 확인)를
-    쓴다. "sub/../../escape.txt"처럼 중간에 서브디렉토리를 거쳐 탈출을
-    시도하는 경로도 resolve()가 정규화하므로 동일하게 걸러진다.
-    """
-    base_dir = Path(base_dir).resolve()
-    target = (base_dir / filename).resolve()
-
-    if base_dir not in target.parents and target != base_dir:
-        return "Error: 허용된 디렉토리 밖에는 쓸 수 없습니다."
-
-    try:
-        target.write_text(content, encoding="utf-8")
-    except OSError as exc:
-        return f"Error: 파일을 쓰는 중 오류가 발생했습니다 ({exc})"
-    return f"OK: {filename}에 저장했습니다."
-
-
-def make_write_text_file_tool(base_dir: Path):
-    """지정된 base_dir에 고정된 write_text_file @tool을 만든다."""
-
-    @tool
-    def write_sandbox_file(filename: str, content: str) -> str:
-        """샌드박스 디렉토리 안에 텍스트 파일을 새로 쓰거나 덮어쓴다."""
-        return write_text_file(filename, content, base_dir)
-
-    return write_sandbox_file
-
-
-def make_read_text_file_tool(base_dir: Path):
-    """지정된 base_dir에 고정된 read_text_file @tool을 만든다.
-
-    read_text_file 자체는 base_dir을 인자로 받는 순수 함수라 테스트하기
-    쉽지만, LLM이 호출하는 도구는 filename만 인자로 받아야 하므로(도구
-    스키마가 LLM에게 그대로 노출된다) base_dir을 클로저로 고정한 래퍼가
-    필요하다.
-    """
-
-    @tool
-    def read_sandbox_file(filename: str) -> str:
-        """샌드박스 디렉토리 안에 있는 텍스트 파일의 내용을 읽는다."""
-        return read_text_file(filename, base_dir)
-
-    return read_sandbox_file
+@tool
+def fetch_repo_source_sample(repo: str) -> str:
+    """GitHub 저장소에서 대표적인 소스 파일 몇 개의 내용을 가져와 코드 리뷰에 쓴다.
+    repo는 'owner/repo' 형식이어야 한다 (예: 'langchain-ai/langgraph')."""
+    return fetch_repo_source_sample_text(repo)

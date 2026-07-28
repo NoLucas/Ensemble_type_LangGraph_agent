@@ -1,5 +1,5 @@
 """
-코드/데이터 작업 에이전트 - Streamlit 웹 인터페이스.
+GitHub 저장소 리뷰 에이전트 - Streamlit 웹 인터페이스.
 
 main.py에 정의된 make_llm()/extract_text()를 그대로 재사용한다. 오케스트레이션
 로직(build_graph)은 agent/ 패키지에만 있고, 이 파일은 그걸 채팅 UI로
@@ -12,9 +12,9 @@ import streamlit as st
 from agent.graph import build_graph
 from main import extract_text, make_llm
 
-st.set_page_config(page_title="코드/데이터 작업 에이전트", page_icon="🛠️")
-st.title("🛠️ 코드/데이터 작업 에이전트")
-st.caption("계산 · 샌드박스 파일 읽기 · 파일 쓰기를 병렬로 처리하는 LangGraph 에이전트")
+st.set_page_config(page_title="GitHub 저장소 리뷰 에이전트", page_icon="🔎")
+st.title("🔎 GitHub 저장소 리뷰 에이전트")
+st.caption("언급된 GitHub 저장소의 개요와 소스 코드를 가져와 요약 + 코드 리뷰를 병렬로 작성하는 LangGraph 에이전트")
 
 
 @st.cache_resource
@@ -44,7 +44,7 @@ for message in st.session_state.agent_state["messages"]:
             with st.chat_message("assistant"):
                 st.write(text)
 
-user_input = st.chat_input("메시지를 입력하세요 (예: '123*456 계산하고 결과를 result.txt에 저장해줘')")
+user_input = st.chat_input("리뷰할 저장소를 입력하세요 (예: 'langchain-ai/langgraph 리뷰해줘')")
 if user_input:
     with st.chat_message("user"):
         st.write(user_input)

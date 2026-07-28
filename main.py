@@ -1,5 +1,5 @@
 """
-코드/데이터 작업 에이전트 - 콘솔 인터페이스.
+GitHub 저장소 리뷰 에이전트 - 콘솔 인터페이스.
 
 agent.graph.build_graph()로 조립한 그래프를 실제 ChatAnthropic과 연결해서
 터미널에서 대화형으로 사용할 수 있게 한다. 그래프에 체크포인터가 없으므로,
@@ -47,8 +47,8 @@ def main() -> None:
     # 안전하게 누적된다.
     state = {"messages": [], "iteration": 0, "report_drafts": []}
 
-    print("코드/데이터 작업 에이전트입니다.")
-    print("계산(예: '23*17 계산해줘'), 샌드박스 파일 읽기/쓰기를 요청해보세요.")
+    print("GitHub 저장소 리뷰 에이전트입니다.")
+    print("리뷰할 저장소를 owner/repo 형식으로 알려주세요 (예: 'langchain-ai/langgraph 리뷰해줘').")
     print("종료하려면 'exit' 또는 'quit'을 입력하세요.\n")
 
     while True:

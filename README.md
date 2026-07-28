@@ -1,6 +1,6 @@
 # Ensemble_type_LangGraph_agent
 
-LangGraph 기반 코드/데이터 작업 에이전트입니다. TDD(Red-Green-Refactor)로 개발되었으며, 계산·파일 읽기·파일 쓰기 도구를 병렬로 처리하고, 최종 보고서는 동일한 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블 구조입니다.
+LangGraph 기반 GitHub 저장소 리뷰 에이전트입니다. TDD(Red-Green-Refactor)로 개발되었으며, 사용자가 대화에서 언급한 `owner/repo` 저장소의 개요(README)와 대표 소스 코드를 GitHub API로 가져와 병렬 처리하고, 최종 리뷰(요약 + 코드 리뷰)는 동일한 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블 구조입니다.
 
 ## 구조
 
@@ -8,16 +8,16 @@ LangGraph 기반 코드/데이터 작업 에이전트입니다. TDD(Red-Green-Re
         START
           │
           ▼
-      dispatcher                          (첫 입력: 효율적으로 도구 지시)
+      dispatcher                          (첫 입력: 언급된 저장소에 맞는 도구 지시)
           │
    tool_call 없음 ──────────────────► END  (도구 불필요 시 dispatcher 답변이 곧 최종 답변)
           │
    tool_call 있음
           │
-   ┌──────┼───────────────┬──────────┐
-   ▼      ▼               ▼          (도구 팬아웃 — 정적 3-way)
-calculate_node   read_file_node  write_file_node
-   └──────┼───────────────┴──────────┘
+   ┌──────┴──────┐
+   ▼             ▼                       (도구 팬아웃 — 정적 2-way)
+repo_overview_node  repo_source_node
+   └──────┬──────┘
           ▼
    ┌──────┼───────────────┬──────────┐
    ▼      ▼               ▼          (투표형 앙상블 팬아웃 — 정적 3-way,
@@ -30,10 +30,10 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
          END
 ```
 
-- **dispatcher**: 사용자 입력을 해석해 `calculate`(계산) / `read_sandbox_file`(파일 읽기) / `write_sandbox_file`(파일 쓰기) 중 필요한 도구를 지시합니다. 여러 도구가 필요하면 한 번의 응답에서 모두 요청하도록 유도해 팬아웃이 실제로 병렬 이득을 보게 합니다.
-- **도구 팬아웃/팬인**: 세 도구 노드는 항상 함께 깨워지고, 자기 담당 tool_call이 없으면 조용히 통과(pass-through)합니다.
-- **투표형 앙상블 팬아웃/팬인**: `voter_1`/`voter_2`/`voter_3`는 **모두 같은 프롬프트(`VOTER_SYSTEM_PROMPT`)**로 최종 보고서를 각자 독립적으로 시도합니다. 관점을 나누는 앙상블이 아니라 같은 과제를 여러 번 독립 시도해서 검증하는 투표 앙상블이며, 다양성은 프롬프트가 아니라 모델 샘플링 자체의 변동성(temperature)에서 나옵니다.
-- **vote_for_best_report**: 세 candidate 중 도구 실행 결과(`ToolMessage`)를 실제로 포함한 것만 통과시키고, **LLM을 다시 호출하지 않고** 문자열 일치 개수로 결정론적으로 승자를 고르는 함수입니다. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크하고, 아무도 사실을 못 맞혀도 예외 없이 첫 번째 voter의 답을 반환합니다. "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않으므로, 이 종합 단계에는 환각이 새로 끼어들 여지가 없습니다.
+- **dispatcher**: 사용자 입력에서 언급된 GitHub 저장소(`owner/repo`)를 해석해 `fetch_repo_overview`(개요/README) / `fetch_repo_source_sample`(대표 소스 코드) 중 필요한 도구를 지시합니다. 여러 저장소·도구가 필요하면 한 번의 응답에서 모두 요청하도록 유도해 팬아웃이 실제로 병렬 이득을 보게 합니다.
+- **도구 팬아웃/팬인**: 두 도구 노드는 항상 함께 깨워지고, 자기 담당 tool_call이 없으면 조용히 통과(pass-through)합니다.
+- **투표형 앙상블 팬아웃/팬인**: `voter_1`/`voter_2`/`voter_3`는 **모두 같은 프롬프트(`VOTER_SYSTEM_PROMPT`)**로 "요약 + 코드 리뷰" 두 섹션을 포함한 최종 리뷰를 각자 독립적으로 시도합니다. 관점을 나누는 앙상블이 아니라 같은 과제를 여러 번 독립 시도해서 검증하는 투표 앙상블이며, 다양성은 프롬프트가 아니라 모델 샘플링 자체의 변동성(temperature)에서 나옵니다.
+- **vote_for_best_report**: 세 candidate 중 도구 실행 결과(`ToolMessage`: 저장소 개요/소스 코드)를 실제로 포함한 것만 통과시키고, **LLM을 다시 호출하지 않고** 문자열 일치 개수로 결정론적으로 승자를 고르는 함수입니다. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크하고, 아무도 사실을 못 맞혀도 예외 없이 첫 번째 voter의 답을 반환합니다. "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않으므로, 이 종합 단계에는 환각이 새로 끼어들 여지가 없습니다.
 - **도구가 필요 없으면** dispatcher의 답변이 그대로 최종 답변이 되고, 도구 팬아웃/투표 팬아웃 단계는 아예 실행되지 않습니다 (불필요한 LLM 호출을 만들지 않습니다).
 
 이 그래프는 사이클이 없는 DAG입니다 — `dispatcher`는 tool이 바인딩된 llm을, `voter_*` 노드들은 바인딩되지 않은 llm을 받아서 구조적으로 도구를 다시 호출할 수 없습니다. 그래서 반복 상한(iteration cap) 같은 무한 루프 방지 장치가 필요 없습니다.
@@ -43,14 +43,13 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 ```
 agent/
   state.py    # AgentState: messages(add_messages), iteration(operator.add 델타), report_drafts(operator.add)
-  tools.py    # calculate, read_text_file, write_text_file (+ 샌드박스 경로 탈출 방지)
+  tools.py    # fetch_repo_overview, fetch_repo_source_sample (GitHub REST API, 비인증)
   nodes.py    # dispatcher/voter/vote_for_best_report 노드, 라우팅 함수, 도구 실행 노드
-  graph.py    # build_graph(llm, sandbox_dir) — 전체 그래프 조립
-  sandbox_data/  # read/write 도구가 접근 가능한 샌드박스 디렉토리
+  graph.py    # build_graph(llm) — 전체 그래프 조립
 tests/
-  conftest.py         # FakeChatModel — 실제 API 호출 없이 결정적 테스트
+  conftest.py         # FakeChatModel + mock_github_get(QueuedGet) — 실제 API 호출 없이 결정적 테스트
   test_state.py        # state reducer 테스트
-  test_tools.py         # 도구 단위 테스트 (정상/거부 케이스)
+  test_tools.py         # 도구 단위 테스트 (정상/실패 케이스)
   test_nodes.py          # 노드 단위 테스트
   test_routing.py         # 조건부 라우팅 테스트
   test_graph_e2e.py        # 그래프 통합 테스트
@@ -60,11 +59,12 @@ tests/
 
 | 도구 | 설명 | 안전장치 |
 |---|---|---|
-| `calculate` | 사칙연산 + 괄호 산술 계산 | `eval` 없이 `ast` 화이트리스트로만 평가 |
-| `read_sandbox_file` | 샌드박스 안 텍스트 파일 읽기 | `resolve()` 후 base_dir 하위인지 검사, 경로 탈출 차단 |
-| `write_sandbox_file` | 샌드박스 안 텍스트 파일 쓰기/덮어쓰기 | 동일한 경계 검사로 중첩 경로 탈출도 차단 |
+| `fetch_repo_overview` | 저장소 메타데이터(설명/언어/stars)와 README 발췌 | `owner/repo` 형식 검증, 저장소 없음(404)/rate limit(403)/네트워크 오류를 예외 대신 에러 문자열로 반환 |
+| `fetch_repo_source_sample` | 저장소 트리에서 대표 소스 파일 최대 3개의 내용 발췌 | 소스 확장자 화이트리스트, `tests/vendor/node_modules` 등 경로 제외, 파일당/README 길이 상한 |
 
-모든 도구는 예외를 던지지 않고 `"Error: ..."` 문자열을 반환합니다 — LLM이 스키마와 맞지 않는 입력을 줄 수 있으므로, 실패도 정상적인 반환값으로 표현해서 그래프 전체가 죽지 않게 합니다.
+모든 도구는 예외를 던지지 않고 `"Error: ..."` 문자열을 반환합니다 — LLM이 스키마와 맞지 않는 입력을 줄 수 있고 GitHub API도 실패할 수 있으므로, 실패도 정상적인 반환값으로 표현해서 그래프 전체가 죽지 않게 합니다.
+
+GitHub API는 **비인증으로 호출**합니다(시간당 60회 제한). 저장소를 많이/자주 리뷰하면 금방 제한에 걸릴 수 있습니다 — 필요하면 `agent/tools.py`의 `requests.get` 호출에 `Authorization: Bearer <GITHUB_TOKEN>` 헤더를 추가해 시간당 5000회로 늘릴 수 있습니다.
 
 ## 설치 및 테스트
 
@@ -75,7 +75,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-현재 48개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD).
+현재 42개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD).
 
 느린 테스트(실LLM 호출)는 `integration` 마커로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
 
@@ -83,7 +83,7 @@ pytest
 pytest -m "not integration"
 ```
 
-`tests/conftest.py`의 `FakeChatModel`은 `threading.Lock`으로 `invoke()`를 보호합니다 — voter 3개가 그래프 실행 중 같은 `FakeChatModel` 인스턴스를 스레드 풀에서 동시에 호출하므로, 락이 없으면 `calls` 증가와 응답 인덱싱이 경합해 테스트가 간헐적으로 실패할 수 있습니다.
+`tests/conftest.py`의 `FakeChatModel`은 `threading.Lock`으로 `invoke()`를 보호합니다 — voter 3개가 그래프 실행 중 같은 `FakeChatModel` 인스턴스를 스레드 풀에서 동시에 호출하므로, 락이 없으면 `calls` 증가와 응답 인덱싱이 경합해 테스트가 간헐적으로 실패할 수 있습니다. `mock_github_get`(`QueuedGet`)은 `requests.get`을 호출 순서 기반 더미로 교체해 실제 GitHub API를 타지 않고 도구 로직을 검증합니다.
 
 ## 그래프 사용 예시
 
@@ -95,7 +95,7 @@ llm = ChatAnthropic(model="claude-sonnet-5")
 graph = build_graph(llm)
 
 result = graph.invoke({
-    "messages": [("human", "2+2 계산하고 sales.txt 내용도 읽어줘")],
+    "messages": [("human", "langchain-ai/langgraph 요약이랑 코드 리뷰 둘 다 해줘")],
     "iteration": 0,
     "report_drafts": [],
 })
