@@ -36,12 +36,67 @@ _SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs",
     ".java", ".kt", ".rb", ".c", ".cpp", ".cs",
 }
-# 테스트/벤더/빌드 산출물 경로는 "저장소의 진짜 코드"가 아니므로 후보에서 뺀다.
-_SKIP_PATH_PARTS = {"test", "tests", "vendor", "node_modules", "dist", "build", ".github"}
+# 테스트/벤더/빌드 산출물/예제 경로는 "저장소의 진짜 구현 코드"가 아니므로
+# 후보에서 뺀다. examples/demo는 특히 중요한 제외 대상이다 — 흔히
+# index.js/main.py 같은 진입점 파일명을 그대로 쓰기 때문에, 진입점 가산점
+# 때문에 실제 라이브러리 구현(lib/, src/)보다 먼저 뽑히는 경우가 실제로
+# 있었다(psf/requests 등으로 수동 검증 중 expressjs/express에서 발견).
+_SKIP_PATH_PARTS = {
+    "test", "tests", "vendor", "node_modules", "dist", "build", ".github",
+    "example", "examples", "demo", "demos", "sample", "samples",
+}
+
+# GitHub 저장소 메타데이터의 language 필드(예: "Python") -> 그 언어의 대표
+# 확장자. 소스 파일 후보를 고를 때 "저장소의 실제 주 언어와 일치하는 파일"에
+# 가산점을 준다 — 화이트리스트에 여러 언어 확장자가 섞여 있다 보니, 예를 들어
+# Python 저장소인데 우연히 섞여 있는 .js 설정 스크립트가 뽑히는 걸 막는다.
+_LANGUAGE_EXTENSIONS = {
+    "python": {".py"},
+    "javascript": {".js", ".jsx"},
+    "typescript": {".ts", ".tsx"},
+    "go": {".go"},
+    "rust": {".rs"},
+    "java": {".java"},
+    "kotlin": {".kt"},
+    "ruby": {".rb"},
+    "c++": {".cpp"},
+    "c": {".c"},
+    "c#": {".cs"},
+}
+# 파일명(확장자 제외)이 이 목록에 있으면 "저장소의 진입점"일 가능성이 높다고
+# 보고 가산점을 준다.
+_ENTRYPOINT_STEMS = {"main", "__main__", "__init__", "index", "app", "cli", "server", "run"}
+
+# 이 범위 밖의 파일 크기는 리뷰 가치가 낮다고 본다: 너무 작으면(스텁/빈
+# 파일) 볼 코드가 없고, 너무 크면 생성된 코드·데이터·번들일 가능성이 높다
+# (또 어차피 _MAX_FILE_CHARS로 잘려서 앞부분만 봐도 대표성이 떨어진다).
+_MIN_USEFUL_FILE_SIZE = 50
+_MAX_USEFUL_FILE_SIZE = 20000
 
 _MAX_README_CHARS = 3000
 _MAX_SOURCE_FILES = 3
 _MAX_FILE_CHARS = 1500
+
+
+def _score_source_candidate(path: str, size: int, primary_extensions: set[str]) -> int:
+    """소스 파일 후보 하나의 "리뷰 대표성" 점수를 매긴다. 높을수록 먼저 뽑힌다.
+
+    결정론적 정렬을 위한 점수이지 정밀한 랭킹 알고리즘이 아니다 — 몇 가지
+    뚜렷한 신호(주 언어 일치, 진입점 파일명, 얕은 경로, 적당한 크기)만
+    단순 가산/감산으로 조합한다.
+    """
+    p = Path(path)
+    score = 0
+    if p.suffix in primary_extensions:
+        score += 10  # 저장소의 대표 언어와 일치하는 파일을 최우선시한다.
+    if p.stem.lower() in _ENTRYPOINT_STEMS:
+        score += 5  # 진입점으로 보이는 파일명.
+    score -= path.count("/")  # 얕은 경로일수록(핵심에 가까울수록) 가산.
+    if size == 0:
+        score -= 100  # 빈 파일은 리뷰할 내용이 없으므로 사실상 배제한다.
+    elif _MIN_USEFUL_FILE_SIZE <= size <= _MAX_USEFUL_FILE_SIZE:
+        score += 2  # 스텁도 생성 코드 덤프도 아닌, 읽을 만한 크기.
+    return score
 
 
 def _auth_headers(extra: dict | None = None) -> dict:
@@ -146,16 +201,20 @@ def fetch_repo_source_sample_text(repo: str) -> str:
     if tree_response.status_code != 200:
         return f"Error: 파일 목록을 가져오지 못했습니다 (status={tree_response.status_code})."
 
+    primary_extensions = _LANGUAGE_EXTENSIONS.get((meta.get("language") or "").lower(), set())
     candidates = [
-        item["path"]
+        (item["path"], item.get("size", 0))
         for item in tree_response.json().get("tree", [])
         if item.get("type") == "blob"
         and Path(item["path"]).suffix in _SOURCE_EXTENSIONS
         and not (_SKIP_PATH_PARTS & set(Path(item["path"]).parts))
     ]
-    # 경로 깊이가 얕은(=저장소의 핵심에 가까운) 파일부터, 동률이면 이름순으로.
-    candidates.sort(key=lambda p: (p.count("/"), p))
-    selected = candidates[:_MAX_SOURCE_FILES]
+    # 점수 높은 순(주 언어 일치 > 진입점 파일명 > 얕은 경로 > 적당한 크기),
+    # 동점이면 경로 이름순으로 결정론적으로 정렬한다.
+    candidates.sort(
+        key=lambda c: (-_score_source_candidate(c[0], c[1], primary_extensions), c[0])
+    )
+    selected = [path for path, _size in candidates[:_MAX_SOURCE_FILES]]
 
     if not selected:
         return f"({repo}에서 리뷰할 소스 파일을 찾지 못했습니다.)"

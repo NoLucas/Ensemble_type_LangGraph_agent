@@ -47,7 +47,7 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 
 - **dispatcher**: `fetch_repo_overview`/`fetch_repo_source_sample`를 bind_tools한 llm 사용. 사용자가 언급한 저장소마다 필요한 도구를 한 번에 요청하도록 유도.
 - **repo_overview_node**: 저장소 메타데이터(설명/언어/stars/forks/topics) + README 발췌(최대 3000자)를 텍스트로 조립.
-- **repo_source_node**: 저장소 트리에서 소스 확장자(.py/.js/.ts/.go/...) 파일 중 `tests`/`vendor`/`node_modules` 등을 제외하고, 경로 깊이가 얕은 순으로 최대 3개를 골라 내용(파일당 최대 1500자)을 가져옴.
+- **repo_source_node**: 저장소 트리에서 소스 확장자(.py/.js/.ts/.go/...) 파일 중 `tests`/`vendor`/`node_modules`/`examples` 등을 제외하고, `_score_source_candidate()`로 점수(주 언어 일치 +10, 진입점 파일명 +5, 얕은 경로 가산, 빈 파일 -100/적당한 크기 +2)를 매겨 상위 3개의 내용(파일당 최대 1500자)을 가져옴.
 - **voter_1/2/3**: **모두 같은 프롬프트**(`VOTER_SYSTEM_PROMPT`)로 "요약 + 코드 리뷰" 두 섹션을 포함한 리뷰를 독립 시도. 관점을 나누지 않는다 — 다양성은 모델 샘플링 자체의 변동성에서 나온다(실서비스에서는 temperature). bind_tools 안 된 llm이라 구조적으로 도구를 재호출 못 함.
 - **vote_for_best_report**: `llm` 파라미터가 아예 없는 순수 함수. 도구 실행 결과(`ToolMessage`)에서 뽑은 "사실 토큰"(숫자/영문 파일명·식별자/한글 단어)을 candidate가 몇 개나 포함하는지로 채점해 다수결로 선택. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크.
 
@@ -65,7 +65,7 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 ## 실행 / 테스트
 
 ```bash
-venv/Scripts/python.exe -m pytest -q        # 47개 테스트 (FakeChatModel + QueuedGet 기반 45개 + 실LLM 통합 2개, 전부 통과해야 정상)
+venv/Scripts/python.exe -m pytest -q        # 53개 테스트 (FakeChatModel + QueuedGet 기반 51개 + 실LLM 통합 2개, 전부 통과해야 정상)
 python main.py                              # 콘솔
 streamlit run app.py                        # Streamlit 웹
 chainlit run chainlit_app.py                # Chainlit 웹 (도구 실행 과정 시각화)
@@ -91,6 +91,7 @@ venv/Scripts/python.exe -m pip install -r requirements.txt
 - **CI 실제 통과 확인**: GitHub Actions에서 이 세션의 push 7개 전부 `success` 확인함(로컬 통과만이 아니라 실제 Actions 로그로 검증).
 - **Chainlit 인터페이스 다듬기 + 실제 브라우저 수동 테스트**: `chainlit.md`/`.chainlit/config.toml`의 이름·설명을 새 목적에 맞게 갱신, `@cl.set_starters`로 예시 프롬프트 3개 추가, `on_message`에 `try/except`로 LLM 호출 실패 시 친절한 에러 메시지 추가. 실제 브라우저로 "개요만" / "요약+코드 리뷰" 두 시나리오를 끝까지 실행해서 Step 시각화·투표·한글 렌더링이 정상임을 확인했고, GitHub rate limit에 실제로 걸렸을 때도 도구가 에러 문자열을 반환하고 voter가 이를 자연스럽게 리포트에 반영하는 것까지 확인했다(설계대로 동작).
 - **수동 테스트로 실제 버그 발견 및 수정**: `chainlit_app.py`의 `graph.stream(..., stream_mode="updates")` 루프가 `node_output.get(...)`을 호출하는데, 설치된 LangGraph 1.2.9에서는 노드가 아무 것도 반환하지 않으면(`{}`가 아니라) 업데이트 값 자체가 `None`으로 온다 — `repo_overview_node`/`repo_source_node`가 항상 함께 깨워지지만 자기 몫이 없으면 통과하는 설계상 **매 요청마다 발생하는 정상 케이스**인데도 `.get()`이 `NoneType`에서 죽었다. `node_output is None`이면 continue하도록 수정. 이 프로젝트의 FakeChatModel 기반 테스트는 `graph.invoke()`만 검증하고 `graph.stream(stream_mode="updates")`의 실제 반환 모양은 검증하지 않아서 놓쳤던 버그 — 실제 LLM + 실제 브라우저로 돌려보지 않았다면 못 잡았을 것.
+- **`fetch_repo_source_sample`의 파일 선택을 "경로 깊이만"에서 "점수 기반"으로 고도화**: 저장소의 대표 언어(`language` 메타데이터)와 확장자 일치, 진입점 파일명(`main`/`index`/`app`/`__init__` 등), 얕은 경로, 적당한 파일 크기(50~20000바이트, 빈 파일은 사실상 배제)를 점수로 합산해 상위 3개를 고른다(`_score_source_candidate()`). `psf/requests`/`expressjs/express` 등 실제 저장소로 수동 검증하는 과정에서 `examples/`의 데모 `index.js`가 진입점 가산점 때문에 실제 라이브러리 구현(`lib/`)보다 먼저 뽑히는 문제를 발견해 `_SKIP_PATH_PARTS`에 `examples`/`demo`/`sample` 계열을 추가로 제외했다(`bugfix.md` 참고 — 유닛 테스트 픽스처만으로는 못 잡고 실제 저장소로 눈으로 확인해야 드러난 문제).
 
 ### 아직 안 된 것 / 알려진 한계
 - **체크포인터(SqliteSaver) 미지원**: `agent/graph.py`의 `build_graph()`가 `checkpointer` 파라미터를 받지 않는다. (사용자 확인: 필요 없음.)

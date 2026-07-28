@@ -152,6 +152,121 @@ def test_fetch_repo_source_sample_text_success(mock_github_get):
     assert "test_main.py" not in result
 
 
+def test_fetch_repo_source_sample_text_prefers_primary_language_over_shallower_file(
+    mock_github_get,
+):
+    # 저장소의 대표 언어는 Python이다. app.js가 경로는 더 얕지만(루트),
+    # 주 언어와 일치하는 nested/pkg/util.py가 우선 선택되어야 한다 —
+    # 다른 언어로 섞여 들어온 설정/빌드 스크립트보다 실제 코드가 리뷰
+    # 대상으로서 더 대표성이 있다.
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main", "language": "Python"}),
+            FakeResponse(
+                200,
+                json_data={
+                    "tree": [
+                        {"path": "app.js", "type": "blob", "size": 500},
+                        {"path": "nested/pkg/util.py", "type": "blob", "size": 500},
+                    ]
+                },
+            ),
+            FakeResponse(200, text="def util(): pass"),
+            FakeResponse(200, text="console.log('hi')"),
+        ]
+    )
+
+    result = fetch_repo_source_sample_text("octocat/hello-world")
+
+    assert result.startswith("### nested/pkg/util.py")
+
+
+def test_fetch_repo_source_sample_text_prefers_entrypoint_filename(mock_github_get):
+    # 네 파일 모두 같은 언어·같은 깊이지만, main.py만 진입점 파일명이다.
+    # _MAX_SOURCE_FILES(3)이라 넷 중 하나는 밀려나야 하는데, 점수가 가장
+    # 낮은 일반 파일(알파벳 역순으로 utils.py)이 밀려나고 main.py는 항상
+    # 포함되며 맨 먼저 나와야 한다.
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main", "language": "Python"}),
+            FakeResponse(
+                200,
+                json_data={
+                    "tree": [
+                        {"path": "utils.py", "type": "blob", "size": 500},
+                        {"path": "helpers.py", "type": "blob", "size": 500},
+                        {"path": "config.py", "type": "blob", "size": 500},
+                        {"path": "main.py", "type": "blob", "size": 500},
+                    ]
+                },
+            ),
+            FakeResponse(200, text="config"),
+            FakeResponse(200, text="helpers"),
+            FakeResponse(200, text="main"),
+        ]
+    )
+
+    result = fetch_repo_source_sample_text("octocat/hello-world")
+
+    assert result.startswith("### main.py")
+    assert "utils.py" not in result  # 알파벳순 동점 최하위라 3개 슬롯에서 밀려남
+
+
+def test_fetch_repo_source_sample_text_excludes_examples_directory(mock_github_get):
+    # examples/ 하위 파일은 흔히 index.js 같은 진입점 파일명을 그대로 쓴다.
+    # 그대로 두면 진입점 가산점 때문에 실제 라이브러리 구현(lib/)보다
+    # examples가 먼저 뽑히는 문제가 실제로 있었다(expressjs/express로
+    # 수동 검증 중 발견) — examples/를 스킵 목록에 추가해서 고쳤다.
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main", "language": "JavaScript"}),
+            FakeResponse(
+                200,
+                json_data={
+                    "tree": [
+                        {"path": "examples/auth/index.js", "type": "blob", "size": 500},
+                        {"path": "lib/application.js", "type": "blob", "size": 500},
+                    ]
+                },
+            ),
+            FakeResponse(200, text="app"),
+        ]
+    )
+
+    result = fetch_repo_source_sample_text("octocat/hello-world")
+
+    assert "examples/" not in result
+    assert "lib/application.js" in result
+
+
+def test_fetch_repo_source_sample_text_excludes_empty_files(mock_github_get):
+    # empty.py(size=0)는 사실상 배제되어, 나머지 3개(a/b/c.py)가 선택돼야 한다.
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main", "language": "Python"}),
+            FakeResponse(
+                200,
+                json_data={
+                    "tree": [
+                        {"path": "empty.py", "type": "blob", "size": 0},
+                        {"path": "a.py", "type": "blob", "size": 500},
+                        {"path": "b.py", "type": "blob", "size": 500},
+                        {"path": "c.py", "type": "blob", "size": 500},
+                    ]
+                },
+            ),
+            FakeResponse(200, text="a"),
+            FakeResponse(200, text="b"),
+            FakeResponse(200, text="c"),
+        ]
+    )
+
+    result = fetch_repo_source_sample_text("octocat/hello-world")
+
+    assert "empty.py" not in result
+    assert "a.py" in result and "b.py" in result and "c.py" in result
+
+
 def test_fetch_repo_source_sample_text_no_matching_files(mock_github_get):
     mock_github_get(
         [

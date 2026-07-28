@@ -176,3 +176,71 @@ LLM이 저장소를 `https://github.com/owner/repo` 전체 URL이나 `owner`만,
   `fetch_repo_overview_text`, `fetch_repo_source_sample_text`
 - `tests/test_tools.py` — 케이스별 정상/실패 테스트
 - `tests/conftest.py` — `FakeResponse`/`QueuedGet` (requests.get 모킹)
+
+---
+
+# Bugfix: `examples/` 폴더의 데모 스크립트가 실제 라이브러리 구현보다 먼저 뽑히던 문제
+
+## 증상
+
+`fetch_repo_source_sample_text`의 파일 선택 로직을 "경로 깊이만" 보던 방식에서
+"주 언어 일치 + 진입점 파일명 + 깊이 + 크기" 점수 합산 방식으로 개선한 뒤,
+`langgraph`/`requests` 같은 저장소로는 잘 동작했지만 `expressjs/express`로 수동
+검증하자 결과가 이상했다.
+
+```
+### index.js
+### examples/auth/index.js
+### examples/content-negotiation/index.js
+```
+
+세 번째 항목까지 전부 데모/예제 코드였고, 정작 라이브러리의 실제 구현(`lib/`)은
+하나도 뽑히지 않았다.
+
+## 원인
+
+Node.js/npm 생태계는 관례적으로 거의 모든 디렉토리에 `index.js`를 둔다
+(모듈 해석 규칙 때문에). 진입점 파일명에 주는 가산점(+5)이 경로 깊이 페널티
+(레벨당 -1)보다 커서, `examples/auth/index.js`(깊이 2, 점수 10+5-2+2=15)가
+`lib/application.js`(진입점 아님, 깊이 1, 점수 10+0-1+2=11)를 점수로 이겨버렸다.
+"진입점처럼 보이는 파일명"이라는 신호가 예제 코드에는 아무 의미가 없는데도
+똑같이 가산점을 준 것이 근본 원인이다.
+
+## 해결
+
+`_SKIP_PATH_PARTS`(테스트/벤더/빌드 산출물 제외 목록)에 `example`/`examples`/
+`demo`/`demos`/`sample`/`samples`를 추가해서, 점수를 매기기도 전에 후보에서
+아예 제외했다. 진입점 가산점의 가중치를 조정하는 대신 "애초에 후보가 아니다"로
+접근한 이유는, `tests/`를 제외하는 것과 동일한 종류의 판단(저장소의 "진짜 코드"가
+아니다)이라 기존 필터와 일관되고, 다른 언어의 예제 디렉토리(`examples/`,
+`sample/` 등 명명 관례가 JS 생태계 밖에서도 흔하다)에도 똑같이 적용되기 때문이다.
+
+```python
+_SKIP_PATH_PARTS = {
+    "test", "tests", "vendor", "node_modules", "dist", "build", ".github",
+    "example", "examples", "demo", "demos", "sample", "samples",
+}
+```
+
+수정 후 재검증:
+
+```
+### index.js
+### lib/application.js
+### lib/express.js
+```
+
+## 교훈
+
+`tests/test_tools.py`의 모킹된 단위 테스트는 이 문제를 잡지 못했다 — 테스트
+픽스처가 애초에 "그럴듯한" 파일 몇 개만 만들어뒀지, 실제 저장소처럼 같은
+파일명이 여러 디렉토리에 반복되는 상황을 재현하지 않았기 때문이다. 휴리스틱/
+스코어링 로직을 짤 때는 실제 유명 오픈소스 저장소 몇 개(언어를 다양하게)로
+직접 돌려보고 결과를 눈으로 확인하는 과정이 유닛 테스트만으로는 못 잡는
+"각 신호가 실제로 어떻게 상호작용하는지"를 드러낸다.
+
+## 관련 파일
+
+- `agent/tools.py` — `_SKIP_PATH_PARTS`에 예제/데모 경로 추가
+- `tests/test_tools.py` — `test_fetch_repo_source_sample_text_excludes_examples_directory`
+  회귀 테스트 추가

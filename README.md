@@ -60,9 +60,20 @@ tests/
 | 도구 | 설명 | 안전장치 |
 |---|---|---|
 | `fetch_repo_overview` | 저장소 메타데이터(설명/언어/stars)와 README 발췌 | `owner/repo` 형식 검증, 저장소 없음(404)/rate limit(403)/네트워크 오류를 예외 대신 에러 문자열로 반환 |
-| `fetch_repo_source_sample` | 저장소 트리에서 대표 소스 파일 최대 3개의 내용 발췌 | 소스 확장자 화이트리스트, `tests/vendor/node_modules` 등 경로 제외, 파일당/README 길이 상한 |
+| `fetch_repo_source_sample` | 저장소 트리에서 대표 소스 파일 최대 3개의 내용 발췌 | 소스 확장자 화이트리스트, `tests/vendor/node_modules/examples` 등 경로 제외, 파일당/README 길이 상한 |
 
 모든 도구는 예외를 던지지 않고 `"Error: ..."` 문자열을 반환합니다 — LLM이 스키마와 맞지 않는 입력을 줄 수 있고 GitHub API도 실패할 수 있으므로, 실패도 정상적인 반환값으로 표현해서 그래프 전체가 죽지 않게 합니다.
+
+### `fetch_repo_source_sample`의 파일 선택 기준
+
+경로 깊이만 보고 고르지 않고, 다음 신호를 점수로 합산해 가장 대표성 있는 파일을 고릅니다(`agent/tools.py`의 `_score_source_candidate`):
+
+- **저장소의 대표 언어(`language` 메타데이터)와 확장자가 일치**하는 파일 우선 (예: Python 저장소면 `.py` 우선)
+- **진입점으로 보이는 파일명**(`main`/`index`/`app`/`cli`/`__init__`/`server`/`run`) 우선
+- **경로가 얕을수록** 약간 가산 (저장소 핵심에 가까운 코드일 가능성)
+- **적당한 크기**(50~20,000바이트)의 파일 우선 — 빈 파일(스텁)은 사실상 배제하고, 지나치게 큰 파일(생성 코드·데이터 덤프)은 감점
+
+`examples`/`demo`/`sample` 경로는 아예 후보에서 제외합니다 — 흔히 `index.js` 같은 진입점 파일명을 그대로 써서, 제외하지 않으면 실제 라이브러리 구현(`lib/`, `src/`)보다 먼저 뽑히는 경우가 있었습니다.
 
 GitHub API는 기본적으로 **비인증으로 호출**합니다(시간당 60회 제한). `.env`에 `GITHUB_TOKEN`을 설정하면 모든 요청에 자동으로 `Authorization: Bearer <GITHUB_TOKEN>` 헤더가 붙어 시간당 5000회로 늘어납니다(`agent/tools.py`의 `_auth_headers()`). 별도 권한이 필요 없는(공개 저장소 읽기 전용) [개인용 액세스 토큰](https://github.com/settings/tokens)이면 충분합니다. 토큰을 설정하지 않으면 기존과 동일하게 비인증으로 동작합니다.
 
@@ -75,7 +86,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-현재 47개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD 45개 + 실LLM 통합 테스트 2개).
+현재 53개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD 51개 + 실LLM 통합 테스트 2개).
 
 느린 테스트(실LLM + 실제 GitHub API 호출)는 `integration` 마커(`tests/test_integration.py`)로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
 
