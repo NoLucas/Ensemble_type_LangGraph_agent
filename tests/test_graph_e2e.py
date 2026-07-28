@@ -2,9 +2,16 @@
 그래프 통합(E2E) 테스트.
 
 실제 도구(calculate, read_text_file)와 FakeChatModel을 결합해서 그래프
-전체가 model -> tools -> model -> END 순서로 정상 순환하는지 검증한다.
-LLM 자체는 가짜지만, 도구 실행과 상태 병합(add_messages reducer,
-iteration 누적)은 실제 코드 경로를 그대로 탄다.
+전체가 model -> [calculate_node, read_file_node] (병렬 팬아웃) -> model
+(팬인) -> ... -> END 순서로 정상 순환하는지 검증한다. LLM 자체는 가짜지만,
+도구 실행과 상태 병합(add_messages reducer, iteration 누적)은 실제 코드
+경로를 그대로 탄다.
+
+가장 중요한 케이스는 test_graph_fans_out_to_both_tools_in_a_single_round다:
+모델이 한 번의 응답에서 calculate와 read_sandbox_file을 동시에 요청하면,
+model 호출 2번(요청 1번 + 최종 답변 1번)만으로 두 도구가 모두 실행돼야
+한다. 순차 ReAct 루프였다면 도구마다 model을 한 번씩 더 거쳐야 하므로,
+이 테스트가 깨지면 팬아웃이 아니라 다시 순차 구조로 퇴행했다는 뜻이다.
 """
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -54,6 +61,39 @@ def test_graph_reads_sandbox_file_via_tool(fake_llm_factory, sandbox_dir):
     )
 
     assert "매출 100억" in result["messages"][-1].content
+
+
+def test_graph_fans_out_to_both_tools_in_a_single_round(fake_llm_factory, sandbox_dir):
+    (sandbox_dir / "sales.txt").write_text("1200", encoding="utf-8")
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "calculate", "args": {"expression": "2+2"}, "id": "call_calc"},
+                {
+                    "name": "read_sandbox_file",
+                    "args": {"filename": "sales.txt"},
+                    "id": "call_read",
+                },
+            ],
+        ),
+        AIMessage(content="계산 결과 4, 매출 파일 내용 1200을 확인했습니다."),
+    ]
+    llm = fake_llm_factory(responses)
+    graph = build_graph(llm, sandbox_dir=sandbox_dir)
+
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="계산도 하고 파일도 읽어줘")], "iteration": 0}
+    )
+
+    # model이 정확히 2번만 호출됐다는 것 자체가 두 도구가 순차가 아니라
+    # 같은 라운드에서 병렬로 처리됐다는 증거다.
+    assert llm.calls == 2
+    assert result["iteration"] == 2
+
+    tool_messages = {m.tool_call_id: m.content for m in result["messages"] if isinstance(m, ToolMessage)}
+    assert tool_messages["call_calc"] == "4"
+    assert tool_messages["call_read"] == "1200"
 
 
 def test_graph_stops_without_calling_tools_when_model_answers_directly(fake_llm_factory):

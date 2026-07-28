@@ -1,9 +1,30 @@
 """
-코드/데이터 작업 에이전트의 StateGraph 조립.
+코드/데이터 작업 에이전트의 StateGraph 조립 (팬아웃/팬인 구조).
 
-model 노드가 tool_calls를 반환하면 tools 노드로, 아니면 END로 가는
-단순한 model <-> tools 순환 구조다 (langgraph.org의 표준 ReAct 패턴).
-반복 상한은 route_after_model(agent/nodes.py)이 강제한다.
+        START
+          |
+          v
+        model
+          |
+   (tool_call 있음)
+          |
+   ┌──────┴──────────────┐
+   v                      v
+calculate_node      read_file_node        (병렬 팬아웃)
+   └──────┬──────────────┘
+          v
+        model                             (팬인)
+          |
+     (tool_call 없음)
+          v
+         END
+
+model이 tool_call을 반환하면 calculate_node와 read_file_node를 항상 함께
+팬아웃한다. 각 노드는 자기 담당 tool_call이 없으면 조용히 통과하고, 결과는
+add_edge(["calculate_node", "read_file_node"], "model")로 다시 model로
+팬인한다. tool_call이 하나뿐이어도 두 노드를 함께 깨우는 이유는, 이 팬인
+조인이 "나열된 두 노드가 이번 라운드에 모두 실행됐는지"로 트리거되기
+때문이다 — 한쪽만 조건부로 건너뛰면 조인이 영원히 기다리게 된다.
 
 llm은 항상 함수 인자로 주입한다. build_graph() 안에서 전역으로 실제
 ChatModel을 인스턴스화하지 않기 때문에, 테스트에서는 FakeChatModel을,
@@ -15,9 +36,8 @@ from functools import partial
 from pathlib import Path
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode
 
-from agent.nodes import call_model, route_after_model
+from agent.nodes import calculate_node, call_model, read_file_node, route_after_model
 from agent.state import AgentState
 from agent.tools import calculate, make_read_text_file_tool
 
@@ -30,10 +50,15 @@ def build_graph(llm, sandbox_dir: Path = DEFAULT_SANDBOX_DIR):
 
     builder = StateGraph(AgentState)
     builder.add_node("model", partial(call_model, llm=bound_llm))
-    builder.add_node("tools", ToolNode(tools))
+    builder.add_node("calculate_node", calculate_node)
+    builder.add_node("read_file_node", read_file_node(sandbox_dir))
 
     builder.add_edge(START, "model")
-    builder.add_conditional_edges("model", route_after_model, ["tools", END])
-    builder.add_edge("tools", "model")
+    builder.add_conditional_edges(
+        "model", route_after_model, ["calculate_node", "read_file_node", END]
+    )
+    # 팬인 조인: calculate_node와 read_file_node가 둘 다 실행된 뒤에만 model이
+    # 다시 실행된다. route_after_model이 둘을 항상 함께 팬아웃하므로 성립한다.
+    builder.add_edge(["calculate_node", "read_file_node"], "model")
 
     return builder.compile()
