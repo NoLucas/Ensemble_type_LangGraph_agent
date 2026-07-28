@@ -56,3 +56,8 @@ def test_routes_to_end_at_iteration_cap_even_with_pending_tool_call():
 def test_routes_to_fanout_just_below_iteration_cap():
     state = {"messages": [_ai_message_with_tool_call()], "iteration": MAX_ITERATIONS - 1}
     assert route_after_model(state) == FANOUT_TOOL_NODES
+
+
+def test_fanout_has_three_specialized_tool_nodes():
+    # calculate / read / write로 역할이 세분화된 3-way 팬아웃이어야 한다.
+    assert FANOUT_TOOL_NODES == ["calculate_node", "read_file_node", "write_file_node"]

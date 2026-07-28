@@ -10,7 +10,7 @@ LLM이 임의의 문자열을 도구에 넘길 수 있다고 가정하고, 위�
 
 import pytest
 
-from agent.tools import calculate, read_text_file
+from agent.tools import calculate, read_text_file, write_text_file
 
 
 # ---------------------------------------------------------------------------
@@ -88,3 +88,51 @@ def test_read_text_file_missing_file_returns_error_not_exception(sandbox_dir):
     result = read_text_file("does_not_exist.txt", base_dir=sandbox_dir)
 
     assert result.startswith("Error")
+
+
+# ---------------------------------------------------------------------------
+# write_text_file: 샌드박스 디렉토리 밖에는 절대 쓸 수 없어야 한다
+# ---------------------------------------------------------------------------
+
+
+def test_write_text_file_creates_new_file(sandbox_dir):
+    result = write_text_file("output.txt", "hello world", base_dir=sandbox_dir)
+
+    assert result.startswith("OK")
+    assert (sandbox_dir / "output.txt").read_text(encoding="utf-8") == "hello world"
+
+
+def test_write_text_file_overwrites_existing_file(sandbox_dir):
+    target = sandbox_dir / "existing.txt"
+    target.write_text("old content", encoding="utf-8")
+
+    result = write_text_file("existing.txt", "new content", base_dir=sandbox_dir)
+
+    assert result.startswith("OK")
+    assert target.read_text(encoding="utf-8") == "new content"
+
+
+def test_write_text_file_rejects_path_traversal(sandbox_dir, tmp_path):
+    result = write_text_file("../escape.txt", "malicious", base_dir=sandbox_dir)
+
+    assert result.startswith("Error")
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_write_text_file_rejects_absolute_path(sandbox_dir, tmp_path):
+    outside = tmp_path / "outside.txt"
+
+    result = write_text_file(str(outside), "malicious", base_dir=sandbox_dir)
+
+    assert result.startswith("Error")
+    assert not outside.exists()
+
+
+def test_write_text_file_rejects_writing_outside_via_nested_traversal(sandbox_dir, tmp_path):
+    nested = sandbox_dir / "sub"
+    nested.mkdir()
+
+    result = write_text_file("sub/../../escape.txt", "malicious", base_dir=sandbox_dir)
+
+    assert result.startswith("Error")
+    assert not (tmp_path / "escape.txt").exists()

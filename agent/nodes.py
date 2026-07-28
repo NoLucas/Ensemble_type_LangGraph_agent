@@ -20,22 +20,23 @@ from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.graph import END
 
 from agent.state import AgentState
-from agent.tools import calculate, make_read_text_file_tool
+from agent.tools import calculate, make_read_text_file_tool, make_write_text_file_tool
 
-SYSTEM_PROMPT = """당신은 계산과 파일 조회를 도와주는 작업 에이전트입니다.
+SYSTEM_PROMPT = """당신은 계산, 파일 조회, 파일 저장을 도와주는 작업 에이전트입니다.
 산술 계산이 필요하면 calculate 도구를, 샌드박스 안의 텍스트 파일을 읽어야 하면
-read_sandbox_file 도구를 사용하세요. 한 번에 여러 도구가 필요하면 동시에
-요청해도 됩니다. 더 이상 도구가 필요 없다면 최종 답변을 말로 정리해서
-응답하세요."""
+read_sandbox_file 도구를, 결과를 파일로 저장해야 하면 write_sandbox_file 도구를
+사용하세요. 한 번에 여러 도구가 필요하면 동시에 요청해도 됩니다. 더 이상 도구가
+필요 없다면 최종 답변을 말로 정리해서 응답하세요."""
 
 # 모델이 tool_calls를 계속 반환해도 여기서 강제로 그래프를 종료시킨다.
 # 이게 없으면 모델이 같은 도구를 무한히 호출하는 경우 API 비용이 무한정 발생한다.
 MAX_ITERATIONS = 10
 
 # route_after_model이 팬아웃할 때 항상 함께 반환하는 노드 이름 목록.
-# graph.py의 add_edge(["calculate_node", "read_file_node"], "model") 팬인과
-# 반드시 짝이 맞아야 한다.
-FANOUT_TOOL_NODES = ["calculate_node", "read_file_node"]
+# 계산(calculate) / 읽기(read) / 쓰기(write)로 역할을 세분화한 3-way 팬아웃.
+# graph.py의 add_edge(["calculate_node", "read_file_node", "write_file_node"],
+# "model") 팬인과 반드시 짝이 맞아야 한다.
+FANOUT_TOOL_NODES = ["calculate_node", "read_file_node", "write_file_node"]
 
 
 def call_model(state: AgentState, llm) -> dict:
@@ -112,5 +113,16 @@ def read_file_node(sandbox_dir):
 
     def _node(state: AgentState) -> dict:
         return _run_matching_tool_calls(state, "read_sandbox_file", read_tool)
+
+    return _node
+
+
+def write_file_node(sandbox_dir):
+    """sandbox_dir에 고정된 write_file_node 함수를 만든다. read_file_node와
+    동일한 클로저 패턴이다."""
+    write_tool = make_write_text_file_tool(sandbox_dir)
+
+    def _node(state: AgentState) -> dict:
+        return _run_matching_tool_calls(state, "write_sandbox_file", write_tool)
 
     return _node

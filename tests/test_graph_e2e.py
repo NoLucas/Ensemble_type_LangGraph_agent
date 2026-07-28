@@ -63,7 +63,7 @@ def test_graph_reads_sandbox_file_via_tool(fake_llm_factory, sandbox_dir):
     assert "매출 100억" in result["messages"][-1].content
 
 
-def test_graph_fans_out_to_both_tools_in_a_single_round(fake_llm_factory, sandbox_dir):
+def test_graph_fans_out_to_all_three_tools_in_a_single_round(fake_llm_factory, sandbox_dir):
     (sandbox_dir / "sales.txt").write_text("1200", encoding="utf-8")
     responses = [
         AIMessage(
@@ -75,25 +75,58 @@ def test_graph_fans_out_to_both_tools_in_a_single_round(fake_llm_factory, sandbo
                     "args": {"filename": "sales.txt"},
                     "id": "call_read",
                 },
+                {
+                    "name": "write_sandbox_file",
+                    "args": {"filename": "result.txt", "content": "4"},
+                    "id": "call_write",
+                },
             ],
         ),
-        AIMessage(content="계산 결과 4, 매출 파일 내용 1200을 확인했습니다."),
+        AIMessage(content="계산 결과 4, 매출 파일 내용 1200 확인, result.txt 저장까지 완료했습니다."),
     ]
     llm = fake_llm_factory(responses)
     graph = build_graph(llm, sandbox_dir=sandbox_dir)
 
     result = graph.invoke(
-        {"messages": [HumanMessage(content="계산도 하고 파일도 읽어줘")], "iteration": 0}
+        {"messages": [HumanMessage(content="계산하고 파일도 읽고 결과도 저장해줘")], "iteration": 0}
     )
 
-    # model이 정확히 2번만 호출됐다는 것 자체가 두 도구가 순차가 아니라
-    # 같은 라운드에서 병렬로 처리됐다는 증거다.
+    # model이 정확히 2번만 호출됐다는 것 자체가 세 도구가 순차가 아니라
+    # 같은 라운드에서 병렬로 처리됐다는 증거다. 순차 구조였다면 도구마다
+    # model을 한 번씩 더 거쳐야 하므로 llm.calls가 4가 됐을 것이다.
     assert llm.calls == 2
     assert result["iteration"] == 2
 
     tool_messages = {m.tool_call_id: m.content for m in result["messages"] if isinstance(m, ToolMessage)}
     assert tool_messages["call_calc"] == "4"
     assert tool_messages["call_read"] == "1200"
+    assert tool_messages["call_write"].startswith("OK")
+    assert (sandbox_dir / "result.txt").read_text(encoding="utf-8") == "4"
+
+
+def test_graph_writes_sandbox_file_via_tool(fake_llm_factory, sandbox_dir):
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "write_sandbox_file",
+                    "args": {"filename": "note.txt", "content": "저장된 메모"},
+                    "id": "call_1",
+                }
+            ],
+        ),
+        AIMessage(content="note.txt에 저장했습니다."),
+    ]
+    llm = fake_llm_factory(responses)
+    graph = build_graph(llm, sandbox_dir=sandbox_dir)
+
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="메모 저장해줘")], "iteration": 0}
+    )
+
+    assert "저장" in result["messages"][-1].content
+    assert (sandbox_dir / "note.txt").read_text(encoding="utf-8") == "저장된 메모"
 
 
 def test_graph_stops_without_calling_tools_when_model_answers_directly(fake_llm_factory):

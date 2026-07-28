@@ -19,7 +19,7 @@ model이 반환한 마지막 AIMessage의 tool_calls 중 자기 이름과 일치
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agent.nodes import calculate_node, read_file_node
+from agent.nodes import calculate_node, read_file_node, write_file_node
 from agent.nodes import call_model
 
 
@@ -132,6 +132,47 @@ def test_read_file_node_passes_through_when_no_matching_tool_call(sandbox_dir):
     state = {"messages": [HumanMessage(content="계산해줘"), ai_message], "iteration": 1}
 
     node = read_file_node(sandbox_dir)
+    result = node(state)
+
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# write_file_node: write_sandbox_file tool_call만 담당, 나머지는 통과
+# ---------------------------------------------------------------------------
+
+
+def test_write_file_node_executes_matching_tool_call(sandbox_dir):
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_sandbox_file",
+                "args": {"filename": "out.txt", "content": "결과"},
+                "id": "call_3",
+            }
+        ],
+    )
+    state = {"messages": [HumanMessage(content="저장해줘"), ai_message], "iteration": 1}
+
+    node = write_file_node(sandbox_dir)
+    result = node(state)
+
+    assert len(result["messages"]) == 1
+    tool_message = result["messages"][0]
+    assert tool_message.content.startswith("OK")
+    assert tool_message.tool_call_id == "call_3"
+    assert (sandbox_dir / "out.txt").read_text(encoding="utf-8") == "결과"
+
+
+def test_write_file_node_passes_through_when_no_matching_tool_call(sandbox_dir):
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[{"name": "calculate", "args": {"expression": "1+1"}, "id": "call_1"}],
+    )
+    state = {"messages": [HumanMessage(content="계산해줘"), ai_message], "iteration": 1}
+
+    node = write_file_node(sandbox_dir)
     result = node(state)
 
     assert result == {}

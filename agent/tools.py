@@ -84,6 +84,37 @@ def read_text_file(filename: str, base_dir: Path) -> str:
         return f"Error: 파일을 읽는 중 오류가 발생했습니다 ({exc})"
 
 
+def write_text_file(filename: str, content: str, base_dir: Path) -> str:
+    """base_dir 하위에만 텍스트 파일을 쓴다. 경로 탈출은 전부 거부한다.
+
+    read_text_file과 동일한 경계 검사(resolve() 후 base_dir 하위인지 확인)를
+    쓴다. "sub/../../escape.txt"처럼 중간에 서브디렉토리를 거쳐 탈출을
+    시도하는 경로도 resolve()가 정규화하므로 동일하게 걸러진다.
+    """
+    base_dir = Path(base_dir).resolve()
+    target = (base_dir / filename).resolve()
+
+    if base_dir not in target.parents and target != base_dir:
+        return "Error: 허용된 디렉토리 밖에는 쓸 수 없습니다."
+
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return f"Error: 파일을 쓰는 중 오류가 발생했습니다 ({exc})"
+    return f"OK: {filename}에 저장했습니다."
+
+
+def make_write_text_file_tool(base_dir: Path):
+    """지정된 base_dir에 고정된 write_text_file @tool을 만든다."""
+
+    @tool
+    def write_sandbox_file(filename: str, content: str) -> str:
+        """샌드박스 디렉토리 안에 텍스트 파일을 새로 쓰거나 덮어쓴다."""
+        return write_text_file(filename, content, base_dir)
+
+    return write_sandbox_file
+
+
 def make_read_text_file_tool(base_dir: Path):
     """지정된 base_dir에 고정된 read_text_file @tool을 만든다.
 
