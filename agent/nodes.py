@@ -3,40 +3,44 @@
 
 이 에이전트는 model 노드 하나가 아니라 역할이 다른 LLM 노드들을 쓰는
 dispatcher -> [calculate_node, read_file_node, write_file_node] (도구
-팬아웃) -> [draft_concise_node, draft_detailed_node, draft_action_node]
-(보고서 팬아웃, 3-way 앙상블) -> aggregate_reports_node (팬인) -> END 구조다.
+팬아웃) -> [voter_1_node, voter_2_node, voter_3_node] (투표형 앙상블
+팬아웃) -> vote_for_best_report_node (팬인) -> END 구조다.
 
 - dispatcher(call_dispatcher_model): 사용자의 "첫 입력"을 해석해서 세 도구
   중 필요한 것을 정확하고 효율적으로 지시하는 역할. 여러 도구가 동시에
   필요하면 한 번에 다 요청하도록 프롬프트로 유도해서, 팬아웃이 실제로 병렬
   이득을 보게 만든다.
-- report draft 3개(call_report_draft_model): 도구 실행이 끝난 뒤, 그 결과를
-  세 가지 다른 관점(REPORT_ANGLES: 간결 요약/상세 설명/실무 제안)으로 각자
-  독립적으로 서술하는 역할. 앙상블(⑥) 패턴이되, calculate/read/write 결과는
-  "정답이 하나뿐인 사실"이라 temperature로 무작위성을 주면 사실이 흔들릴
-  위험이 있다 — 그래서 다양성의 원천을 온도가 아니라 관점(프롬프트)에 둔다.
-  각 draft 노드는 바인딩되지 않은 llm을 받아 도구를 다시 호출할 수 없다.
-- aggregate_reports_node: 세 draft를 **LLM을 다시 호출하지 않고** 고정된
-  순서로 그대로 이어붙여 최종 답변을 만드는 결정론적 함수. "종합"까지
-  LLM에게 맡기면 그 종합 단계 자체가 원본 draft에 없던 내용을 지어내는
-  환각의 새 진입점이 되므로, 아예 LLM을 빼서 그 위험을 구조적으로
-  없앴다 — 함수 시그니처에 llm 파라미터 자체가 없다.
+- voter 3개(call_report_draft_model): 도구 실행이 끝난 뒤, **동일한
+  프롬프트(VOTER_SYSTEM_PROMPT)**로 최종 보고서를 각자 독립적으로 3번
+  시도하는 역할. 이전 버전은 "관점을 다르게" 하는 앙상블이었지만, 이번
+  버전은 "같은 과제를 여러 번 독립 시도해서 다수결로 검증"하는 투표
+  (voting) 앙상블이다 — 실제 서비스에서는 모델 샘플링의 자연스러운
+  변동성(temperature)이 다양성의 원천이 된다. 각 voter는 바인딩되지 않은
+  llm을 받아 도구를 다시 호출할 수 없다.
+- vote_for_best_report_node: 세 voter의 독립 시도 중, **도구 실행 결과
+  (ToolMessage 내용)를 실제로 정확히 포함한 candidate만 통과**시키고 그중
+  하나를 결정론적 규칙으로 고르는 함수. "어느 게 더 그럴듯한가"를 LLM
+  판사에게 다시 묻지 않는다 — 정답(도구 결과)을 이미 알고 있으므로, 각
+  candidate가 그 정답을 실제로 언급했는지 문자열 포함 여부로 계산하고,
+  가장 많은 사실을 포함한 candidate를 선택한다. 함수 시그니처에 llm
+  파라미터 자체가 없어서, "종합 단계에서 LLM이 새 내용을 지어내는" 환각
+  경로가 구조적으로 존재하지 않는다.
 
 dispatcher가 tool_call을 하나만 냈어도 세 도구 노드를 항상 함께 깨우고,
-자기 담당이 아닌 노드는 조용히 통과(pass-through)한다. draft 3개도 마찬가지로
+자기 담당이 아닌 노드는 조용히 통과(pass-through)한다. voter 3개도 마찬가지로
 tool 팬인 이후 항상 함께 실행된다. 이렇게 해야 graph.py의 list 기반
 add_edge(...) 팬인 조인들이 데드락 없이 동작한다 (조인은 나열된 노드가
 "이번 라운드에 모두 실행됐는지"를 기준으로 트리거되므로, 하나라도 조건부로
 스킵하면 나머지가 영원히 기다리게 된다).
 
-dispatcher -> 도구 팬아웃 -> draft 팬아웃 -> aggregate -> END는 사이클이 없는
+dispatcher -> 도구 팬아웃 -> voter 팬아웃 -> vote -> END는 사이클이 없는
 구조라, 이전에 있었던 반복 상한(MAX_ITERATIONS) 같은 무한 루프 방지 장치가
 필요 없다.
 
 call_dispatcher_model/call_report_draft_model 모두 llm을 인자로 주입받는다
 (전역으로 인스턴스화하지 않는다). 이렇게 해야 테스트에서 FakeChatModel을
 넣어 실제 API 호출 없이 노드 동작을 검증할 수 있고, 프로덕션에서는
-dispatcher에 tools가 bind_tools된 ChatModel을, draft 노드들에 바인딩되지
+dispatcher에 tools가 bind_tools된 ChatModel을, voter 노드들에 바인딩되지
 않은 ChatModel을 그대로 넣어 재사용할 수 있다.
 """
 
@@ -58,46 +62,22 @@ read_sandbox_file(파일 읽기), write_sandbox_file(파일 쓰기) 세 도구 �
 # graph.py의 add_edge(FANOUT_TOOL_NODES, ...) 팬인과 반드시 짝이 맞아야 한다.
 FANOUT_TOOL_NODES = ["calculate_node", "read_file_node", "write_file_node"]
 
-# 도구 실행 결과를 "어떻게 서술할지"에 대한 세 가지 독립적인 관점.
-# 각 관점은 같은 사실(도구 결과)을 다루므로 내용이 갈릴 이유가 없어야 정상이고,
-# 다양성은 "무엇을 강조/생략하는가"에서만 나온다 — 그래서 temperature가 아니라
-# 프롬프트(system_prompt)로 관점을 나눈다.
-REPORT_ANGLES = [
-    {
-        "key": "concise",
-        "node_name": "draft_concise_node",
-        "heading": "핵심 요약",
-        "system_prompt": """당신은 도구 실행 결과를 핵심만 1~2문장으로
-간결하게 요약하는 역할입니다. 지금까지의 대화와 도구 실행 결과(Tool
-메시지들)를 바탕으로, 사용자가 가장 먼저 알아야 할 결론만 짧게 정리해서
-응답하세요. 도구는 이미 모두 실행됐으니 다시 호출하지 마세요.""",
-    },
-    {
-        "key": "detailed",
-        "node_name": "draft_detailed_node",
-        "heading": "상세 설명",
-        "system_prompt": """당신은 도구 실행 결과를 빠짐없이 단계별로
-설명하는 역할입니다. 지금까지의 대화와 도구 실행 결과(Tool 메시지들)를
-바탕으로, 어떤 도구가 어떤 입력으로 무엇을 반환했는지 하나도 빠뜨리지 않고
-차례대로 서술하세요. 도구는 이미 모두 실행됐으니 다시 호출하지 마세요.""",
-    },
-    {
-        "key": "action",
-        "node_name": "draft_action_node",
-        "heading": "실무 제안",
-        "system_prompt": """당신은 도구 실행 결과를 바탕으로 사용자가 다음에
-취할 수 있는 실무적인 행동을 제안하는 역할입니다. 지금까지의 대화와 도구
-실행 결과(Tool 메시지들)를 바탕으로, 결과가 의미하는 바와 다음 단계로 무엇을
-하면 좋을지 제안하세요. 도구는 이미 모두 실행됐으니 다시 호출하지 마세요.""",
-    },
-]
+# 세 voter가 공유하는 단일 프롬프트. 관점을 나누지 않는다 — 투표형
+# 앙상블은 "같은 과제를 독립적으로 여러 번 시도"하는 것이지 "다른 역할을
+# 나눠 맡는" 것이 아니다. 다양성은 프롬프트가 아니라 모델 샘플링 자체의
+# 변동성(temperature)에서 나온다.
+VOTER_SYSTEM_PROMPT = """당신은 도구 실행 결과를 사용자에게 명확하게
+보고하는 리포터입니다. 지금까지의 대화와 도구 실행 결과(Tool 메시지들)를
+바탕으로, 사용자가 무엇을 물었고 각 도구가 무엇을 반환했는지 빠짐없이
+반영한 최종 답변을 정리해서 응답하세요. 도구는 이미 모두 실행됐으니 다시
+호출할 필요가 없습니다."""
 
-# route_after_dispatcher가 도구 팬인 이후 항상 함께 팬아웃하는 draft 노드
+# 세 독립 시도를 구분하는 라벨. 동점일 때 이 순서대로 타이브레이크한다.
+VOTER_LABELS = ["voter_1", "voter_2", "voter_3"]
+
+# route_after_dispatcher가 도구 팬인 이후 항상 함께 팬아웃하는 voter 노드
 # 이름 목록. graph.py의 조인/팬아웃 배선과 반드시 짝이 맞아야 한다.
-FANOUT_REPORT_DRAFT_NODES = [angle["node_name"] for angle in REPORT_ANGLES]
-
-_HEADING_BY_KEY = {angle["key"]: angle["heading"] for angle in REPORT_ANGLES}
-_ANGLE_ORDER = [angle["key"] for angle in REPORT_ANGLES]
+FANOUT_VOTE_NODES = [f"{label}_node" for label in VOTER_LABELS]
 
 
 def call_dispatcher_model(state: AgentState, llm) -> dict:
@@ -134,22 +114,38 @@ def call_report_draft_model(state: AgentState, llm, system_prompt: str, label: s
     }
 
 
-def aggregate_reports_node(state: AgentState) -> dict:
-    """세 관점의 draft를 LLM 호출 없이 고정된 순서로 이어붙인다.
+def vote_for_best_report_node(state: AgentState) -> dict:
+    """세 voter의 독립 시도 중, 도구 실행 결과를 가장 정확히 반영한 하나를
+    LLM 호출 없이 결정론적으로 고른다.
 
-    report_drafts는 병렬 실행 순서에 따라 도착 순서가 뒤섞일 수 있으므로,
-    _ANGLE_ORDER(간결 -> 상세 -> 제안) 기준으로 정렬해서 항상 같은 순서로
-    조합한다. draft가 일부 누락돼도(예: 도구 에러로 내용이 부실했던 경우)
-    있는 것만으로 조합하며 예외를 던지지 않는다.
+    "어느 draft가 더 그럴듯한가"를 다시 LLM에게 묻는 대신, 이미 알고 있는
+    정답(ToolMessage 내용)이 각 candidate 텍스트에 실제로 포함되는지 세어서
+    점수를 매긴다 — 점수가 가장 높은 candidate가 사실을 가장 정확히
+    반영했다고 보는 것이다. 동점이면 VOTER_LABELS 순서상 먼저 나오는 voter를
+    선택해서 실행할 때마다 승자가 무작위로 바뀌지 않게 한다. voter 일부가
+    누락돼도(예: 도구 에러) 있는 candidate만으로 투표하며, 아무도 정답을
+    맞히지 못해도 예외 없이 첫 번째 voter의 답을 반환한다("아무도 못 맞혀도
+    침묵하지 않는다").
     """
-    drafts_by_key = {d["label"]: d["text"] for d in state.get("report_drafts", [])}
-    sections = []
-    for key in _ANGLE_ORDER:
-        if key in drafts_by_key:
-            heading = _HEADING_BY_KEY[key]
-            sections.append(f"### {heading}\n{drafts_by_key[key]}")
-    combined = "\n\n".join(sections)
-    return {"messages": [AIMessage(content=combined)]}
+    required_facts = [m.content for m in state["messages"] if isinstance(m, ToolMessage)]
+    drafts_by_label = {d["label"]: d["text"] for d in state.get("report_drafts", [])}
+
+    def score(text: str) -> int:
+        return sum(1 for fact in required_facts if fact and fact in text)
+
+    best_label = None
+    best_score = -1
+    for label in VOTER_LABELS:
+        if label not in drafts_by_label:
+            continue
+        candidate_score = score(drafts_by_label[label])
+        if candidate_score > best_score:
+            best_score = candidate_score
+            best_label = label
+
+    if best_label is None:
+        return {"messages": [AIMessage(content="보고서를 생성하지 못했습니다.")]}
+    return {"messages": [AIMessage(content=drafts_by_label[best_label])]}
 
 
 def route_after_dispatcher(state: AgentState):

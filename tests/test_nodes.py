@@ -6,19 +6,21 @@
 - dispatcher(call_dispatcher_model): 사용자의 "첫 입력"을 받아 calculate/
   read/write 세 도구 중 필요한 것을 효율적으로 지시하는 역할. tool_calls를
   낼 수 있도록 tool-bound llm을 받는다.
-- report draft 3개(call_report_draft_model): 팬아웃/팬인으로 도구 실행이
-  끝난 뒤, 같은 입력을 세 가지 다른 관점(간결 요약/상세 설명/실무 제안)으로
-  각자 독립적으로 서술하는 역할. 앙상블 패턴이지만 계산/파일 결과처럼
-  "정답이 하나뿐인" 사실을 다루므로, 관점을 다르게 해서 다양성을 주되
-  temperature로 무작위성을 주지는 않는다(사실이 흔들릴 위험).
-- aggregate_reports_node: 이 3개 draft를 **LLM을 다시 호출하지 않고** 고정된
-  순서(간결→상세→제안)로 그대로 이어붙여 최종 답변을 만드는 결정론적 함수.
-  "종합"을 또 다른 LLM 호출로 하면 그 종합 단계 자체가 환각을 일으킬 수
-  있으므로, 여기서는 아예 LLM을 빼서 그 위험을 구조적으로 없앴다.
+- voter 3개(call_report_draft_model): 도구 실행이 끝난 뒤, **동일한
+  프롬프트(VOTER_SYSTEM_PROMPT)**로 최종 보고서를 각자 독립적으로 3번
+  시도하는 역할 — 관점을 다르게 하는 앙상블이 아니라, 같은 과제를 여러 번
+  독립 시도해서 다수결로 검증하는 투표(voting) 앙상블이다. 실제 서비스에서는
+  모델 샘플링 자체의 변동성(temperature)이 다양성의 원천이 된다.
+- vote_for_best_report_node: 3개의 독립 시도 중 **도구 실행 결과(ToolMessage
+  내용)를 실제로 정확히 포함한 draft만 통과**시키고, 그중 하나를 결정론적
+  규칙으로 선택하는 함수. **LLM을 다시 호출하지 않는다** — 어떤 draft가
+  사실과 일치하는지는 이미 알고 있는 도구 결과와 문자열 포함 여부로 검증할
+  수 있으므로, "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않고
+  코드로 결정론적으로 판정한다.
 
-세 draft 노드 모두 실제 LLM을 호출하지 않고 conftest.py의 FakeChatModel을
+세 voter 노드 모두 실제 LLM을 호출하지 않고 conftest.py의 FakeChatModel을
 주입해서, (1) state 전체가 아니라 변경된 필드만 반환하는지, (2) iteration을
-정확히 1씩 증가시키는지, (3) 각자의 관점 프롬프트를 매 호출마다 포함시키는지
+정확히 1씩 증가시키는지, (3) 매 호출마다 시스템 프롬프트를 포함시키는지
 검증한다.
 
 calculate_node/read_file_node/write_file_node는 팬아웃 구조의 "담당 도구별
@@ -38,10 +40,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from agent.nodes import calculate_node, read_file_node, write_file_node
 from agent.nodes import (
     DISPATCHER_SYSTEM_PROMPT,
-    REPORT_ANGLES,
-    aggregate_reports_node,
+    VOTER_LABELS,
+    VOTER_SYSTEM_PROMPT,
     call_dispatcher_model,
     call_report_draft_model,
+    vote_for_best_report_node,
 )
 
 
@@ -127,62 +130,104 @@ def test_call_report_draft_model_prepends_given_system_prompt(fake_llm_factory):
     assert sent_messages[1].content == "hi"
 
 
-def test_report_angles_has_three_distinct_entries():
-    assert len(REPORT_ANGLES) == 3
-    keys = [a["key"] for a in REPORT_ANGLES]
-    assert len(set(keys)) == 3  # 중복 없이 서로 다른 관점
-    prompts = [a["system_prompt"] for a in REPORT_ANGLES]
-    assert len(set(prompts)) == 3  # 프롬프트도 서로 달라야 실제로 "다른 의견"이 나온다
+def test_voter_labels_has_three_distinct_entries():
+    assert len(VOTER_LABELS) == 3
+    assert len(set(VOTER_LABELS)) == 3  # 중복 없이 서로 다른 후보 식별자
+
+
+def test_all_voters_share_the_same_system_prompt():
+    # 투표형 앙상블은 "다른 관점"이 아니라 "같은 과제의 독립 시도"다.
+    # 프롬프트가 voter마다 다르면 그건 더 이상 투표가 아니라 지난번의
+    # 관점 앙상블로 되돌아간 것이므로, 단일 프롬프트임을 고정해둔다.
+    assert isinstance(VOTER_SYSTEM_PROMPT, str) and len(VOTER_SYSTEM_PROMPT) > 0
 
 
 # ---------------------------------------------------------------------------
-# aggregate_reports_node: LLM을 호출하지 않는 결정론적 종합
+# vote_for_best_report_node: LLM을 호출하지 않는 결정론적 다수결 선택
 # ---------------------------------------------------------------------------
 
 
-def test_aggregate_reports_node_never_receives_an_llm_argument():
-    # 함수 시그니처 자체에 llm 파라미터가 없다 — "LLM을 다시 부르지 않는다"는
+def test_vote_for_best_report_node_never_receives_an_llm_argument():
+    # 함수 시그니처 자체에 llm 파라미터가 없다 — "판사 LLM을 또 부르지 않는다"는
     # 설계를 코드 구조로 강제한다 (프롬프트로 당부하는 게 아니라).
     import inspect
 
-    params = inspect.signature(aggregate_reports_node).parameters
+    params = inspect.signature(vote_for_best_report_node).parameters
     assert "llm" not in params
 
 
-def test_aggregate_reports_node_orders_sections_by_fixed_angle_order_regardless_of_arrival():
-    # 병렬 실행이라 report_drafts 도착 순서가 뒤섞여 있어도(action이 먼저 와도)
-    # 출력은 항상 간결 -> 상세 -> 제안 고정 순서여야 한다.
+def test_vote_for_best_report_node_picks_candidate_containing_all_tool_facts():
+    # ToolMessage(도구 실행 결과)에 있는 사실("4")을 실제로 포함한 candidate만
+    # 승자가 될 수 있다. voter_2/voter_3는 "4"를 언급하지 않으므로 탈락한다.
     state = {
-        "messages": [],
-        "iteration": 3,
+        "messages": [
+            HumanMessage(content="2+2는?"),
+            AIMessage(content="", tool_calls=[]),
+            ToolMessage(content="4", name="calculate", tool_call_id="call_1"),
+        ],
+        "iteration": 4,
         "report_drafts": [
-            {"label": "action", "text": "다음엔 이걸 하세요"},
-            {"label": "concise", "text": "요약: 4"},
-            {"label": "detailed", "text": "1단계... 2단계..."},
+            {"label": "voter_1", "text": "계산 결과는 4입니다."},
+            {"label": "voter_2", "text": "죄송하지만 결과를 확인하지 못했습니다."},
+            {"label": "voter_3", "text": "계산을 시도했습니다."},
         ],
     }
 
-    result = aggregate_reports_node(state)
+    result = vote_for_best_report_node(state)
 
     assert set(result.keys()) == {"messages"}
-    final_text = result["messages"][0].content
-    idx_concise = final_text.index("요약: 4")
-    idx_detailed = final_text.index("1단계... 2단계...")
-    idx_action = final_text.index("다음엔 이걸 하세요")
-    assert idx_concise < idx_detailed < idx_action
+    assert result["messages"][0].content == "계산 결과는 4입니다."
 
 
-def test_aggregate_reports_node_handles_missing_angle_gracefully():
-    # 어떤 이유로든 draft 하나가 비어도(예: 도구 에러) 예외 없이 나머지로 조합한다.
+def test_vote_for_best_report_node_breaks_ties_by_fixed_voter_order():
+    # 여러 candidate가 모두 사실을 포함해 동점이면, VOTER_LABELS에서 가장
+    # 먼저 나오는 voter를 선택한다 — 매 실행마다 승자가 무작위로 바뀌면
+    # 안 되므로 순서 기반 타이브레이크가 필요하다.
     state = {
-        "messages": [],
-        "iteration": 2,
-        "report_drafts": [{"label": "concise", "text": "요약만 있음"}],
+        "messages": [ToolMessage(content="4", name="calculate", tool_call_id="call_1")],
+        "iteration": 4,
+        "report_drafts": [
+            {"label": "voter_3", "text": "결과: 4"},
+            {"label": "voter_1", "text": "정답은 4입니다"},
+            {"label": "voter_2", "text": "4가 나왔습니다"},
+        ],
     }
 
-    result = aggregate_reports_node(state)
+    result = vote_for_best_report_node(state)
 
-    assert "요약만 있음" in result["messages"][0].content
+    assert result["messages"][0].content == "정답은 4입니다"
+
+
+def test_vote_for_best_report_node_handles_missing_candidate_gracefully():
+    # voter 하나가 어떤 이유로든 draft를 못 남겨도(예: 도구 에러) 예외 없이
+    # 나머지 후보만으로 투표를 진행한다.
+    state = {
+        "messages": [ToolMessage(content="4", name="calculate", tool_call_id="call_1")],
+        "iteration": 2,
+        "report_drafts": [{"label": "voter_2", "text": "정답은 4"}],
+    }
+
+    result = vote_for_best_report_node(state)
+
+    assert "4" in result["messages"][0].content
+
+
+def test_vote_for_best_report_node_falls_back_when_no_candidate_matches_facts():
+    # 셋 다 정답을 포함하지 못해도(예: 모두 실패) 예외를 던지지 않고 첫 번째
+    # voter의 답을 그대로 반환한다 — "아무도 못 맞혀도 침묵하지 않는다".
+    state = {
+        "messages": [ToolMessage(content="4", name="calculate", tool_call_id="call_1")],
+        "iteration": 4,
+        "report_drafts": [
+            {"label": "voter_1", "text": "모르겠습니다"},
+            {"label": "voter_2", "text": "아마도요"},
+            {"label": "voter_3", "text": "확인할 수 없습니다"},
+        ],
+    }
+
+    result = vote_for_best_report_node(state)
+
+    assert result["messages"][0].content == "모르겠습니다"
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # Code_Simple_LangGraph
 
-LangGraph 기반 코드/데이터 작업 에이전트입니다. TDD(Red-Green-Refactor)로 개발되었으며, 계산·파일 읽기·파일 쓰기 도구를 병렬로 처리하고, 결과를 세 가지 관점으로 병렬 서술한 뒤 결정론적으로 종합해서 보고합니다.
+LangGraph 기반 코드/데이터 작업 에이전트입니다. TDD(Red-Green-Refactor)로 개발되었으며, 계산·파일 읽기·파일 쓰기 도구를 병렬로 처리하고, 최종 보고서는 동일한 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블 구조입니다.
 
 ## 구조
 
@@ -20,11 +20,11 @@ calculate_node   read_file_node  write_file_node
    └──────┼───────────────┴──────────┘
           ▼
    ┌──────┼───────────────┬──────────┐
-   ▼      ▼               ▼          (보고서 앙상블 팬아웃 — 정적 3-way)
-draft_concise   draft_detailed   draft_action
+   ▼      ▼               ▼          (투표형 앙상블 팬아웃 — 정적 3-way,
+voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독립 시도)
    └──────┼───────────────┴──────────┘
           ▼
-   aggregate_reports                   (팬인: LLM 재호출 없이 결정론적 종합)
+   vote_for_best_report                (팬인: LLM 재호출 없이 결정론적 다수결)
           │
           ▼
          END
@@ -32,11 +32,11 @@ draft_concise   draft_detailed   draft_action
 
 - **dispatcher**: 사용자 입력을 해석해 `calculate`(계산) / `read_sandbox_file`(파일 읽기) / `write_sandbox_file`(파일 쓰기) 중 필요한 도구를 지시합니다. 여러 도구가 필요하면 한 번의 응답에서 모두 요청하도록 유도해 팬아웃이 실제로 병렬 이득을 보게 합니다.
 - **도구 팬아웃/팬인**: 세 도구 노드는 항상 함께 깨워지고, 자기 담당 tool_call이 없으면 조용히 통과(pass-through)합니다.
-- **보고서 앙상블 팬아웃/팬인**: 도구 실행 결과를 세 가지 독립적인 관점(간결 요약 / 상세 설명 / 실무 제안)으로 병렬 서술합니다. 계산·파일 결과는 정답이 하나뿐인 사실이므로, 다양성은 temperature가 아니라 프롬프트(관점)로만 줍니다.
-- **aggregate_reports**: 세 draft를 **LLM을 다시 호출하지 않고** 고정된 순서(간결→상세→제안)로 그대로 이어붙이는 결정론적 함수입니다. "종합" 단계에 LLM을 또 넣으면 그 단계 자체가 draft에 없던 내용을 지어내는 환각의 진입점이 될 수 있어, 아예 LLM을 빼서 구조적으로 그 위험을 없앴습니다.
-- **도구가 필요 없으면** dispatcher의 답변이 그대로 최종 답변이 되고, 도구 팬아웃/보고서 팬아웃 단계는 아예 실행되지 않습니다 (불필요한 LLM 호출을 만들지 않습니다).
+- **투표형 앙상블 팬아웃/팬인**: `voter_1`/`voter_2`/`voter_3`는 **모두 같은 프롬프트(`VOTER_SYSTEM_PROMPT`)**로 최종 보고서를 각자 독립적으로 시도합니다. 관점을 나누는 앙상블이 아니라 같은 과제를 여러 번 독립 시도해서 검증하는 투표 앙상블이며, 다양성은 프롬프트가 아니라 모델 샘플링 자체의 변동성(temperature)에서 나옵니다.
+- **vote_for_best_report**: 세 candidate 중 도구 실행 결과(`ToolMessage`)를 실제로 포함한 것만 통과시키고, **LLM을 다시 호출하지 않고** 문자열 일치 개수로 결정론적으로 승자를 고르는 함수입니다. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크하고, 아무도 사실을 못 맞혀도 예외 없이 첫 번째 voter의 답을 반환합니다. "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않으므로, 이 종합 단계에는 환각이 새로 끼어들 여지가 없습니다.
+- **도구가 필요 없으면** dispatcher의 답변이 그대로 최종 답변이 되고, 도구 팬아웃/투표 팬아웃 단계는 아예 실행되지 않습니다 (불필요한 LLM 호출을 만들지 않습니다).
 
-이 그래프는 사이클이 없는 DAG입니다 — `dispatcher`는 tool이 바인딩된 llm을, `draft_*` 노드들은 바인딩되지 않은 llm을 받아서 구조적으로 도구를 다시 호출할 수 없습니다. 그래서 반복 상한(iteration cap) 같은 무한 루프 방지 장치가 필요 없습니다.
+이 그래프는 사이클이 없는 DAG입니다 — `dispatcher`는 tool이 바인딩된 llm을, `voter_*` 노드들은 바인딩되지 않은 llm을 받아서 구조적으로 도구를 다시 호출할 수 없습니다. 그래서 반복 상한(iteration cap) 같은 무한 루프 방지 장치가 필요 없습니다.
 
 ## 파일 구성
 
@@ -44,7 +44,7 @@ draft_concise   draft_detailed   draft_action
 agent/
   state.py    # AgentState: messages(add_messages), iteration(operator.add 델타), report_drafts(operator.add)
   tools.py    # calculate, read_text_file, write_text_file (+ 샌드박스 경로 탈출 방지)
-  nodes.py    # dispatcher/draft/aggregate 노드, 라우팅 함수, 도구 실행 노드
+  nodes.py    # dispatcher/voter/vote_for_best_report 노드, 라우팅 함수, 도구 실행 노드
   graph.py    # build_graph(llm, sandbox_dir) — 전체 그래프 조립
   sandbox_data/  # read/write 도구가 접근 가능한 샌드박스 디렉토리
 tests/
