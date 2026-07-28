@@ -118,8 +118,10 @@ print(result["messages"][-1].content)
 |------|-----------|----------|
 | `main.py` | 콘솔(터미널) | `python main.py` |
 | `app.py`  | 웹 브라우저(Streamlit) | `streamlit run app.py` |
-| `chainlit_app.py` | 웹 브라우저(Chainlit, 도구 실행 과정 실시간 시각화) | `chainlit run chainlit_app.py` |
+| `chainlit_app.py` | 웹 브라우저(Chainlit, 도구 실행 과정 실시간 시각화) | `chainlit run chainlit_app.py` (또는 `python run_chainlit.py chainlit_app.py`) |
 
 세 파일 모두 `main.py`의 `make_llm()`/`extract_text()`를 공유합니다. 그래프에 체크포인터가 없으므로, 대화 기록은 각 인터페이스가 파이썬 변수(콘솔: 지역 변수, Streamlit: `st.session_state`, Chainlit: `cl.user_session`)로 들고 있다가 매 턴 그래프에 다시 넘겨줍니다.
+
+`chainlit run`이 몇몇 환경(`nest_asyncio` + 최신 `anyio` 조합)에서 정적 프론트엔드 자산을 못 띄우고 500 에러만 뱉는 경우, `run_chainlit.py`를 대신 쓰세요 — `chainlit run`과 똑같은 CLI(`-h`, `--port` 등)를 그대로 지원하면서, 문제의 원인인 `nest_asyncio.apply()` 호출만 무해화합니다. 자세한 원인은 `run_chainlit.py`의 모듈 docstring을 참고하세요.
 
 초기 state에는 `report_drafts: []`를 반드시 포함해야 합니다 — 3-way 투표형 앙상블(`voter_1`/`voter_2`/`voter_3`)이 병렬로 채우는 `operator.add` 리듀서 필드라, 첫 병렬 쓰기 전에 채널이 초기화돼 있어야 안전합니다. `chainlit_app.py`처럼 `graph.invoke()` 대신 `graph.stream()`으로 상태를 직접 재구성하는 경우, `iteration`과 `report_drafts` 모두 **델타/리스트를 누적**해야 합니다(마지막 값으로 덮어쓰면 안 됩니다) — 두 필드 모두 `operator.add` 리듀서를 쓰기 때문입니다.

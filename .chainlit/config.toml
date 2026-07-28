@@ -95,7 +95,7 @@ reaction_on_message_received = false
 
 [UI]
 # Name of the assistant.
-name = "코드/데이터 작업 에이전트"
+name = "GitHub 저장소 리뷰 에이전트"
 
 # default_theme = "dark"
 
@@ -117,7 +117,7 @@ name = "코드/데이터 작업 에이전트"
 confirm_new_chat = true
 
 # Description of the assistant. This is used for HTML tags.
-# description = ""
+description = "GitHub 저장소의 개요와 소스 코드를 병렬로 조회해 요약 + 코드 리뷰를 작성하는 투표형 앙상블 LangGraph 에이전트"
 
 # Chain of Thought (CoT) display mode. Can be "hidden", "tool_call" or "full".
 cot = "full"
