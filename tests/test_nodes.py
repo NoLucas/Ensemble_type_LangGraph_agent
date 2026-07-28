@@ -235,6 +235,46 @@ def test_vote_for_best_report_node_falls_back_when_no_candidate_matches_facts():
     assert result["messages"][0].content == "모르겠습니다"
 
 
+def test_vote_for_best_report_node_uses_token_overlap_not_exact_substring():
+    # 실제 fetch_repo_overview 결과는 여러 줄짜리 자유 서술형 텍스트다.
+    # voter가 이 블록을 통째로 인용하는 일은 없으므로, "candidate에 도구
+    # 결과 전체 문자열이 그대로 포함되는가"만 보면 모든 candidate가 0점이
+    # 되어 다수결이 무력화되고 매번 첫 번째 voter로 fallback된다. 여기서는
+    # 일부러 "정답을 정확히 반영한 candidate"를 voter_3에 두고, "정보를
+    # 못 찾았다"는 무의미한 답을 voter_1에 둔다 — 옛날 로직(완전 문자열
+    # 포함)이었다면 셋 다 0점이라 voter_1(틀린 답)이 채택됐을 상황에서도,
+    # 토큰 겹침 채점은 voter_3(사실을 정확히 담은 답)를 골라야 한다.
+    tool_content = (
+        "# octocat/hello-world\n"
+        "설명: 테스트용 저장소\n"
+        "언어: Python\n"
+        "stars: 42, forks: 7\n"
+    )
+    state = {
+        "messages": [
+            ToolMessage(content=tool_content, name="fetch_repo_overview", tool_call_id="call_1"),
+        ],
+        "iteration": 4,
+        "report_drafts": [
+            {"label": "voter_1", "text": "죄송하지만 정보를 확인하지 못했습니다."},
+            {
+                "label": "voter_2",
+                "text": "이 저장소는 JavaScript로 작성되었고 stars 9999개를 받았습니다.",
+            },
+            {
+                "label": "voter_3",
+                "text": "octocat/hello-world는 Python으로 작성된 저장소로, stars 42개를 받았습니다.",
+            },
+        ],
+    }
+
+    result = vote_for_best_report_node(state)
+
+    assert result["messages"][0].content == (
+        "octocat/hello-world는 Python으로 작성된 저장소로, stars 42개를 받았습니다."
+    )
+
+
 # ---------------------------------------------------------------------------
 # repo_overview_node: fetch_repo_overview tool_call만 담당, 나머지는 통과
 # ---------------------------------------------------------------------------

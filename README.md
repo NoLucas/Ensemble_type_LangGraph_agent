@@ -33,7 +33,7 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 - **dispatcher**: 사용자 입력에서 언급된 GitHub 저장소(`owner/repo`)를 해석해 `fetch_repo_overview`(개요/README) / `fetch_repo_source_sample`(대표 소스 코드) 중 필요한 도구를 지시합니다. 여러 저장소·도구가 필요하면 한 번의 응답에서 모두 요청하도록 유도해 팬아웃이 실제로 병렬 이득을 보게 합니다.
 - **도구 팬아웃/팬인**: 두 도구 노드는 항상 함께 깨워지고, 자기 담당 tool_call이 없으면 조용히 통과(pass-through)합니다.
 - **투표형 앙상블 팬아웃/팬인**: `voter_1`/`voter_2`/`voter_3`는 **모두 같은 프롬프트(`VOTER_SYSTEM_PROMPT`)**로 "요약 + 코드 리뷰" 두 섹션을 포함한 최종 리뷰를 각자 독립적으로 시도합니다. 관점을 나누는 앙상블이 아니라 같은 과제를 여러 번 독립 시도해서 검증하는 투표 앙상블이며, 다양성은 프롬프트가 아니라 모델 샘플링 자체의 변동성(temperature)에서 나옵니다.
-- **vote_for_best_report**: 세 candidate 중 도구 실행 결과(`ToolMessage`: 저장소 개요/소스 코드)를 실제로 포함한 것만 통과시키고, **LLM을 다시 호출하지 않고** 문자열 일치 개수로 결정론적으로 승자를 고르는 함수입니다. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크하고, 아무도 사실을 못 맞혀도 예외 없이 첫 번째 voter의 답을 반환합니다. "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않으므로, 이 종합 단계에는 환각이 새로 끼어들 여지가 없습니다.
+- **vote_for_best_report**: 도구 실행 결과(`ToolMessage`: 저장소 개요/소스 코드)에서 "사실 토큰"(숫자, 영문 파일명/식별자, 한글 단어)을 뽑아, 세 candidate 중 이 토큰을 가장 많이 포함한 것을 **LLM을 다시 호출하지 않고** 결정론적으로 고르는 함수입니다. `ToolMessage` 내용이 수백~수천 자짜리 자유 서술형 텍스트라 voter가 그 블록을 통째로 인용하는 일은 없으므로, "전체 문자열이 그대로 포함되는가"가 아니라 "토큰 단위로 얼마나 겹치는가"로 채점합니다 — voter가 문장을 바꿔 써도(패러프레이즈해도) 숫자/고유명사 같은 사실은 그대로 잡아냅니다. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크하고, 아무도 사실을 못 맞혀도 예외 없이 첫 번째 voter의 답을 반환합니다. "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않으므로, 이 종합 단계에는 환각이 새로 끼어들 여지가 없습니다.
 - **도구가 필요 없으면** dispatcher의 답변이 그대로 최종 답변이 되고, 도구 팬아웃/투표 팬아웃 단계는 아예 실행되지 않습니다 (불필요한 LLM 호출을 만들지 않습니다).
 
 이 그래프는 사이클이 없는 DAG입니다 — `dispatcher`는 tool이 바인딩된 llm을, `voter_*` 노드들은 바인딩되지 않은 llm을 받아서 구조적으로 도구를 다시 호출할 수 없습니다. 그래서 반복 상한(iteration cap) 같은 무한 루프 방지 장치가 필요 없습니다.
@@ -75,7 +75,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-현재 44개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD + 실LLM 통합 테스트 2개).
+현재 45개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD 43개 + 실LLM 통합 테스트 2개).
 
 느린 테스트(실LLM + 실제 GitHub API 호출)는 `integration` 마커(`tests/test_integration.py`)로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
 

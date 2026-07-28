@@ -44,11 +44,21 @@ dispatcher에 tools가 bind_tools된 ChatModel을, voter 노드들에 바인딩�
 않은 ChatModel을 그대로 넣어 재사용할 수 있다.
 """
 
+import re
+
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
 from agent.state import AgentState
 from agent.tools import fetch_repo_overview, fetch_repo_source_sample
+
+# vote_for_best_report_node가 "사실 일치"를 판정할 때 쓰는 토큰 추출 패턴.
+# 세 그룹으로 나뉜다: 숫자(길이 무관, stars 수 등), 영문/경로류(길이 3+,
+# 파일명·식별자), 한글(길이 2+, 조사 한 글자만 우연히 겹치는 걸 막기 위한
+# 최소 길이). 알파벳/한글이 공백 없이 바로 붙어도(예: "42입니다") 정규식
+# 대체(|)가 숫자를 먼저 떼어내므로 "42"와 "입니다"가 별개 토큰으로
+# 분리된다 — 조사가 붙어도 숫자/영문 사실은 그대로 잡힌다.
+_FACT_TOKEN_PATTERN = re.compile(r"\d+|[A-Za-z_./-]{3,}|[가-힣]{2,}")
 
 DISPATCHER_SYSTEM_PROMPT = """당신은 사용자가 언급한 GitHub 저장소(owner/repo
 형식)를 리뷰하기 위해 fetch_repo_overview(저장소 개요/README)와
@@ -119,24 +129,42 @@ def call_report_draft_model(state: AgentState, llm, system_prompt: str, label: s
     }
 
 
+def _extract_fact_tokens(text: str) -> set[str]:
+    return {token.lower() for token in _FACT_TOKEN_PATTERN.findall(text)}
+
+
 def vote_for_best_report_node(state: AgentState) -> dict:
     """세 voter의 독립 시도 중, 도구 실행 결과를 가장 정확히 반영한 하나를
     LLM 호출 없이 결정론적으로 고른다.
 
     "어느 draft가 더 그럴듯한가"를 다시 LLM에게 묻는 대신, 이미 알고 있는
-    정답(ToolMessage 내용: 저장소 개요/소스 코드)이 각 candidate 텍스트에
-    실제로 포함되는지 세어서 점수를 매긴다 — 점수가 가장 높은 candidate가
-    사실을 가장 정확히 반영했다고 보는 것이다. 동점이면 VOTER_LABELS
-    순서상 먼저 나오는 voter를 선택해서 실행할 때마다 승자가 무작위로
-    바뀌지 않게 한다. voter 일부가 누락돼도(예: 도구 에러) 있는 candidate만
-    으로 투표하며, 아무도 정답을 맞히지 못해도 예외 없이 첫 번째 voter의
-    답을 반환한다("아무도 못 맞혀도 침묵하지 않는다").
+    정답(ToolMessage 내용: 저장소 개요/소스 코드)에서 뽑아낸 "사실 토큰"
+    (숫자, 영문 파일명/식별자, 한글 단어)이 각 candidate 텍스트에 몇 개나
+    겹치는지 세어서 점수를 매긴다 — 점수가 가장 높은 candidate가 사실을
+    가장 많이 반영했다고 보는 것이다.
+
+    계산기 버전과 달리 ToolMessage 내용이 수백~수천 자짜리 자유 서술형
+    텍스트(저장소 개요/소스 코드)라, voter가 그 블록을 통째로 인용하는
+    일은 거의 없다 — "candidate 텍스트에 도구 결과 전체 문자열이 그대로
+    포함되는가"만 보면 거의 항상 0점이 나와 다수결이 사실상 무력화된다.
+    그래서 "완전한 문자열 포함"이 아니라 "의미 있는 토큰 단위 겹침"으로
+    채점한다. 토큰만 비교하므로 여전히 LLM을 호출하지 않고, voter가 문장을
+    바꿔 써도(패러프레이즈해도) 숫자/고유명사 같은 사실은 그대로 잡아낸다.
+
+    동점이면 VOTER_LABELS 순서상 먼저 나오는 voter를 선택해서 실행할
+    때마다 승자가 무작위로 바뀌지 않게 한다. voter 일부가 누락돼도(예:
+    도구 에러) 있는 candidate만으로 투표하며, 아무도 사실을 반영하지
+    못해도(전부 0점) 예외 없이 첫 번째 voter의 답을 반환한다("아무도 못
+    맞혀도 침묵하지 않는다").
     """
     required_facts = [m.content for m in state["messages"] if isinstance(m, ToolMessage)]
+    fact_tokens: set[str] = set()
+    for fact in required_facts:
+        fact_tokens |= _extract_fact_tokens(fact)
     drafts_by_label = {d["label"]: d["text"] for d in state.get("report_drafts", [])}
 
     def score(text: str) -> int:
-        return sum(1 for fact in required_facts if fact and fact in text)
+        return len(fact_tokens & _extract_fact_tokens(text))
 
     best_label = None
     best_score = -1

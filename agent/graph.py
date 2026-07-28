@@ -32,7 +32,7 @@ voter_1_node   voter_2_node   voter_3_node        (투표형 앙상블 팬아웃
 - vote_for_best_report: LLM을 전혀 호출하지 않는 순수 함수. 세 candidate
   중 도구 실행 결과(ToolMessage: 저장소 개요/소스 코드)를 실제로 정확히
   포함한 것을 골라 최종 답변으로 쓴다. "어느 게 더 그럴듯한가"를 LLM
-  판사에게 다시 묻는 대신, 이미 알고 있는 정답과의 문자열 일치로
+  판사에게 다시 묻는 대신, 이미 알고 있는 정답에서 뽑아낸 토큰과의 겹침으로
   결정론적으로 판정해서 종합 단계의 환각 위험을 구조적으로 없앴다.
 
 두 팬인 조인(add_edge(FANOUT_TOOL_NODES, voter_node), add_edge(
