@@ -1,4 +1,4 @@
-# Code_Simple_LangGraph
+# Ensemble_type_LangGraph_agent
 
 LangGraph 기반 코드/데이터 작업 에이전트입니다. TDD(Red-Green-Refactor)로 개발되었으며, 계산·파일 읽기·파일 쓰기 도구를 병렬로 처리하고, 최종 보고서는 동일한 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블 구조입니다.
 
