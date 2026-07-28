@@ -75,11 +75,15 @@ pip install -r requirements.txt
 pytest
 ```
 
+현재 48개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD).
+
 느린 테스트(실LLM 호출)는 `integration` 마커로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
 
 ```bash
 pytest -m "not integration"
 ```
+
+`tests/conftest.py`의 `FakeChatModel`은 `threading.Lock`으로 `invoke()`를 보호합니다 — voter 3개가 그래프 실행 중 같은 `FakeChatModel` 인스턴스를 스레드 풀에서 동시에 호출하므로, 락이 없으면 `calls` 증가와 응답 인덱싱이 경합해 테스트가 간헐적으로 실패할 수 있습니다.
 
 ## 그래프 사용 예시
 
@@ -100,4 +104,16 @@ print(result["messages"][-1].content)
 
 `ANTHROPIC_API_KEY`는 `.env.example`을 참고해 `.env` 파일로 설정합니다.
 
-> 현재 이 저장소는 그래프 코어(`agent/`)와 테스트만 포함하며, 콘솔/웹 실행 진입점(예: `main.py`, `app.py`)은 아직 별도로 연결되어 있지 않습니다.
+## 실행 방법
+
+동일한 그래프(`agent/graph.py`의 `build_graph()`)를 세 가지 인터페이스로 실행할 수 있습니다. 오케스트레이션 로직은 `agent/`에만 있고, 인터페이스들은 이를 그대로 재사용합니다.
+
+| 파일 | 인터페이스 | 실행 명령 |
+|------|-----------|----------|
+| `main.py` | 콘솔(터미널) | `python main.py` |
+| `app.py`  | 웹 브라우저(Streamlit) | `streamlit run app.py` |
+| `chainlit_app.py` | 웹 브라우저(Chainlit, 도구 실행 과정 실시간 시각화) | `chainlit run chainlit_app.py` |
+
+세 파일 모두 `main.py`의 `make_llm()`/`extract_text()`를 공유합니다. 그래프에 체크포인터가 없으므로, 대화 기록은 각 인터페이스가 파이썬 변수(콘솔: 지역 변수, Streamlit: `st.session_state`, Chainlit: `cl.user_session`)로 들고 있다가 매 턴 그래프에 다시 넘겨줍니다.
+
+초기 state에는 `report_drafts: []`를 반드시 포함해야 합니다 — 3-way 투표형 앙상블(`voter_1`/`voter_2`/`voter_3`)이 병렬로 채우는 `operator.add` 리듀서 필드라, 첫 병렬 쓰기 전에 채널이 초기화돼 있어야 안전합니다. `chainlit_app.py`처럼 `graph.invoke()` 대신 `graph.stream()`으로 상태를 직접 재구성하는 경우, `iteration`과 `report_drafts` 모두 **델타/리스트를 누적**해야 합니다(마지막 값으로 덮어쓰면 안 됩니다) — 두 필드 모두 `operator.add` 리듀서를 쓰기 때문입니다.

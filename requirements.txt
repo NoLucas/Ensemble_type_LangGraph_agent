@@ -3,3 +3,5 @@ langchain-anthropic>=0.3.0
 python-dotenv>=1.0.0
 streamlit>=1.38.0
 pytest>=8.0.0
+langgraph-checkpoint-sqlite>=2.0.0
+chainlit>=2.0.0
