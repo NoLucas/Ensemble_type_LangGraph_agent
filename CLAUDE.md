@@ -4,7 +4,7 @@
 
 ## 프로젝트 한 줄 요약
 
-LangGraph 기반 **GitHub 저장소 리뷰 에이전트**. TDD(Red-Green-Refactor)로 개발됨. 대화에서 언급된 `owner/repo` 저장소의 개요(README)와 대표 소스 코드를 GitHub REST API(비인증)로 병렬 팬아웃 조회하고, 최종 리뷰(요약 + 코드 리뷰)는 **같은 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블** 구조.
+LangGraph 기반 **GitHub 저장소 리뷰 에이전트**. TDD(Red-Green-Refactor)로 개발됨. 대화에서 언급된 `owner/repo` 저장소의 개요(README)와 대표 소스 코드를 GitHub REST API(기본 비인증, `GITHUB_TOKEN` 설정 시 자동 인증)로 병렬 팬아웃 조회하고, 최종 리뷰(요약 + 코드 리뷰)는 **같은 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블** 구조.
 
 ## 이 저장소와 자매 저장소 (역사적 배경, 현재는 목적이 갈림)
 
@@ -53,7 +53,7 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 
 ## 핵심 설계 결정 (왜 이렇게 했는지)
 
-- **GitHub API는 비인증으로 호출**: 사용자가 명시적으로 선택한 방향(토큰 발급/관리 부담 없음). 시간당 60회 제한이라 저장소 하나를 리뷰할 때마다 최대 5회(overview 2회 + source 3회) 요청이 나가므로, 짧은 시간에 여러 저장소를 반복 리뷰하면 금방 제한에 걸릴 수 있다. 필요해지면 `agent/tools.py`의 `requests.get` 호출에 `Authorization` 헤더를 추가해 토큰 인증으로 전환 가능(코드에 훅은 없음, 아직 요청받지 않아 구현 안 함).
+- **GitHub API는 기본 비인증, `GITHUB_TOKEN`이 있으면 자동 인증**: 처음엔 사용자가 명시적으로 비인증만 선택했지만(토큰 발급/관리 부담 없음), 시간당 60회 제한이 저장소 하나당 최대 5회(overview 2회 + source 3회) 소모라 금방 걸리는 문제가 있어 이후 토큰 인증을 선택적으로 추가했다. `agent/tools.py`의 `_auth_headers()`가 매 `requests.get` 호출 시점에 `os.environ["GITHUB_TOKEN"]`을 읽어 있으면 `Authorization: Bearer ...` 헤더를 붙이고, 없으면 기존과 동일하게 비인증으로 호출한다 — 토큰을 안 넣는 사용자에게는 아무 동작 변화가 없다. 기존 Accept 헤더(raw 콘텐츠 요청)와 병합해야 하므로 헤더를 통째로 덮어쓰지 않고 `dict(extra or {})`에 추가하는 방식을 썼다.
 - **`iteration`은 절대값이 아니라 델타(`Annotated[int, operator.add]`)**: voter 3개가 병렬로 같은 state 스냅샷을 읽고 "현재+1"을 계산하면 `InvalidUpdateError`가 나거나 값이 유실된다(실제로 겪은 버그, `bugfix.md` 참고). 그래서 각 노드가 항상 델타 `1`만 반환하고 리듀서가 합산한다.
 - **`vote_for_best_report_node`에 `llm` 파라미터가 없음**: "종합" 단계에 LLM을 또 넣으면 그 단계 자체가 draft에 없던 내용을 지어내는 환각 진입점이 된다. 함수 시그니처 자체에 `llm`이 없어서 구조적으로 그 경로가 존재하지 않는다.
 - **`vote_for_best_report_node`는 "전체 문자열 포함"이 아니라 "토큰 겹침"으로 채점**: 계산기 버전은 `ToolMessage`가 `"4"`처럼 짧아서 candidate가 그대로 인용하기 쉬웠지만, 저장소 리뷰는 `ToolMessage`가 수백~수천 자짜리 자유 서술형 텍스트라 voter가 그 블록을 통째로 인용하는 일이 없다. 전체 문자열 포함 여부만 봤다면 거의 항상 0점이 나와 다수결이 사실상 무력화되고 매번 `voter_1`로 fallback됐을 것이다(실제로 겪은 버그는 아니지만, 구조를 바꾸지 않고 도구만 교체했다면 반드시 겪었을 문제라 사전에 고쳤다). `_FACT_TOKEN_PATTERN`(`agent/nodes.py`)으로 숫자/영문 식별자/한글 단어를 토큰화해서 겹치는 개수로 채점하도록 바꿨다 — `tests/test_nodes.py`의
@@ -65,7 +65,7 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 ## 실행 / 테스트
 
 ```bash
-venv/Scripts/python.exe -m pytest -q        # 45개 테스트 (FakeChatModel + QueuedGet 기반 43개 + 실LLM 통합 2개, 전부 통과해야 정상)
+venv/Scripts/python.exe -m pytest -q        # 47개 테스트 (FakeChatModel + QueuedGet 기반 45개 + 실LLM 통합 2개, 전부 통과해야 정상)
 python main.py                              # 콘솔
 streamlit run app.py                        # Streamlit 웹
 chainlit run chainlit_app.py                # Chainlit 웹 (도구 실행 과정 시각화)
@@ -87,10 +87,11 @@ venv/Scripts/python.exe -m pip install -r requirements.txt
 - 콘솔(`main.py`) / Streamlit(`app.py`) / Chainlit(`chainlit_app.py`) 진입점을 새 목적에 맞게 텍스트/라벨 갱신
 - 기존 계산/파일 도구(`calculate`/`read_sandbox_file`/`write_sandbox_file`)와 관련 테스트·`sandbox_data/` 완전 제거
 - **실LLM 통합 테스트(`tests/test_integration.py`) 작성 및 실제 API 키로 통과 확인**: `claude-haiku-4-5-20251001` + 실제 GitHub API(`octocat/Hello-World`)로 (1) dispatcher가 대화에서 `owner/repo`를 정확히 도구 인자로 추출하는지, (2) 전체 파이프라인이 voter 3개를 채우고 최종 리뷰를 만들어내는지 검증. `integration` 마커라 기본 `pytest`/CI에서는 제외되고, `ANTHROPIC_API_KEY`가 없으면 실패 대신 skip된다.
+- **`GITHUB_TOKEN` 선택적 인증 지원**: `.env`에 설정하면 모든 GitHub API 호출에 자동으로 `Authorization` 헤더가 붙어 시간당 60회 → 5000회로 늘어난다. 미설정 시 기존과 동일하게 비인증으로 동작(하위 호환).
 
 ### 아직 안 된 것 / 알려진 한계
 - **체크포인터(SqliteSaver) 미지원**: `agent/graph.py`의 `build_graph()`가 `checkpointer` 파라미터를 받지 않는다.
-- **GitHub 비인증 rate limit**: 시간당 60회라 여러 저장소를 짧은 시간에 반복 리뷰하는 시나리오는 취약하다. 필요해지면 토큰 인증으로 전환.
+- **GitHub rate limit은 `GITHUB_TOKEN`으로 완화 가능하지만 기본값은 여전히 비인증**: `.env`에 토큰을 넣지 않으면 시간당 60회 제한 그대로다. `README.md`에 발급 방법을 안내해뒀지만, 자동으로 토큰을 발급/설정해주지는 않는다.
 - **투표 로직이 여전히 완벽하지 않음**: 토큰 겹침으로 개선했지만 `_FACT_TOKEN_PATTERN`은 숫자를 아라비아 숫자로만 인식한다(예: stars 수를 "42"가 아니라 "마흔두 개"로 표현하면 못 잡음). 한글 형태소 분석기가 아니라 정규식 기반이라 조사가 붙은 단어("저장소로", "저장소는")는 원형("저장소")과 정확히 일치하지 않으면 놓칠 수 있다(코드 리뷰용 영문 식별자·숫자는 이 문제가 없다). 실LLM 통합 테스트가 구조(voter 3개 채워짐, 최종 답변에 저장소명 포함)까지는 확인했지만, "다수결이 항상 가장 정확한 draft를 고르는지"까지는 검증하지 않는다.
 - **CI(`.github/workflows/tests.yml`)가 새 테스트 스위트로 통과하는지 로컬에서만 확인함**: 실제 GitHub Actions 실행 로그는 아직 못 봤다. `test_integration.py`는 `integration` 마커라 CI(`pytest -m "not integration"`)에서는 애초에 실행되지 않는다.
 

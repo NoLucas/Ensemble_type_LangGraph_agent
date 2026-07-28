@@ -43,7 +43,7 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 ```
 agent/
   state.py    # AgentState: messages(add_messages), iteration(operator.add 델타), report_drafts(operator.add)
-  tools.py    # fetch_repo_overview, fetch_repo_source_sample (GitHub REST API, 비인증)
+  tools.py    # fetch_repo_overview, fetch_repo_source_sample (GitHub REST API, GITHUB_TOKEN 선택적 인증)
   nodes.py    # dispatcher/voter/vote_for_best_report 노드, 라우팅 함수, 도구 실행 노드
   graph.py    # build_graph(llm) — 전체 그래프 조립
 tests/
@@ -64,7 +64,7 @@ tests/
 
 모든 도구는 예외를 던지지 않고 `"Error: ..."` 문자열을 반환합니다 — LLM이 스키마와 맞지 않는 입력을 줄 수 있고 GitHub API도 실패할 수 있으므로, 실패도 정상적인 반환값으로 표현해서 그래프 전체가 죽지 않게 합니다.
 
-GitHub API는 **비인증으로 호출**합니다(시간당 60회 제한). 저장소를 많이/자주 리뷰하면 금방 제한에 걸릴 수 있습니다 — 필요하면 `agent/tools.py`의 `requests.get` 호출에 `Authorization: Bearer <GITHUB_TOKEN>` 헤더를 추가해 시간당 5000회로 늘릴 수 있습니다.
+GitHub API는 기본적으로 **비인증으로 호출**합니다(시간당 60회 제한). `.env`에 `GITHUB_TOKEN`을 설정하면 모든 요청에 자동으로 `Authorization: Bearer <GITHUB_TOKEN>` 헤더가 붙어 시간당 5000회로 늘어납니다(`agent/tools.py`의 `_auth_headers()`). 별도 권한이 필요 없는(공개 저장소 읽기 전용) [개인용 액세스 토큰](https://github.com/settings/tokens)이면 충분합니다. 토큰을 설정하지 않으면 기존과 동일하게 비인증으로 동작합니다.
 
 ## 설치 및 테스트
 
@@ -75,7 +75,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-현재 45개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD 43개 + 실LLM 통합 테스트 2개).
+현재 47개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD 45개 + 실LLM 통합 테스트 2개).
 
 느린 테스트(실LLM + 실제 GitHub API 호출)는 `integration` 마커(`tests/test_integration.py`)로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
 

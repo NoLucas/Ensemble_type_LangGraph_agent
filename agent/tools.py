@@ -1,11 +1,15 @@
 """
 에이전트가 사용할 도구(tool) 모음.
 
-GitHub 공개 REST API(비인증, 시간당 60회 제한)만 사용해서 두 도구를 제공한다:
+GitHub 공개 REST API를 사용해서 두 도구를 제공한다:
 1. fetch_repo_overview: 저장소 메타데이터(설명/언어/스타 수)와 README 발췌.
    "요약 리포트"의 재료가 된다.
 2. fetch_repo_source_sample: 저장소 트리에서 대표 소스 파일 몇 개를 골라
    내용을 가져온다. "코드 리뷰"의 재료가 된다.
+
+기본은 비인증 호출(시간당 60회 제한)이다. 환경변수 GITHUB_TOKEN이 설정돼
+있으면 자동으로 Authorization 헤더를 붙여 시간당 5000회로 늘어난다 —
+토큰이 없어도 동작은 그대로라 기존 사용자에게 아무 영향이 없다.
 
 두 도구 모두 예외를 던지지 않고 "Error: ..." 문자열을 반환한다. 그래프 안에서
 ToolNode가 도구를 호출하는데, 여기서 예외가 새면 그래프 실행 전체가 죽기
@@ -13,6 +17,7 @@ ToolNode가 도구를 호출하는데, 여기서 예외가 새면 그래프 실�
 반환값으로 표현해야 한다.
 """
 
+import os
 import re
 from pathlib import Path
 
@@ -39,6 +44,21 @@ _MAX_SOURCE_FILES = 3
 _MAX_FILE_CHARS = 1500
 
 
+def _auth_headers(extra: dict | None = None) -> dict:
+    """GITHUB_TOKEN 환경변수가 있으면 Authorization 헤더를 추가한다.
+
+    매 호출 시점에 os.environ을 읽는다(모듈 임포트 시점에 한 번만 읽지
+    않는다) — 그래야 테스트에서 monkeypatch.setenv로 토큰 유무를 바꿔가며
+    검증할 수 있고, 실제로도 프로세스가 떠 있는 동안 .env가 다시
+    로드되는 시나리오를 자연스럽게 반영한다.
+    """
+    headers = dict(extra or {})
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _validate_repo(repo: str) -> str | None:
     """repo가 'owner/repo' 형식이 아니면 에러 문자열을, 맞으면 None을 반환한다."""
     if not repo or not _REPO_PATTERN.match(repo):
@@ -49,14 +69,19 @@ def _validate_repo(repo: str) -> str | None:
 def _fetch_repo_metadata(repo: str):
     """저장소 메타데이터를 가져온다. 성공 시 (dict, None), 실패 시 (None, 에러문자열)."""
     try:
-        response = requests.get(f"{GITHUB_API_BASE}/repos/{repo}", timeout=_REQUEST_TIMEOUT)
+        response = requests.get(
+            f"{GITHUB_API_BASE}/repos/{repo}", headers=_auth_headers(), timeout=_REQUEST_TIMEOUT
+        )
     except requests.RequestException as exc:
         return None, f"Error: GitHub API 요청에 실패했습니다 ({exc})"
 
     if response.status_code == 404:
         return None, f"Error: 저장소를 찾을 수 없습니다 ({repo})."
     if response.status_code == 403:
-        return None, "Error: GitHub API 요청 한도를 초과했습니다 (비인증 시 시간당 60회)."
+        return None, (
+            "Error: GitHub API 요청 한도를 초과했습니다 "
+            "(비인증 시간당 60회 / GITHUB_TOKEN 설정 시 5000회)."
+        )
     if response.status_code != 200:
         return None, f"Error: GitHub API가 예상치 못한 응답을 반환했습니다 (status={response.status_code})."
     return response.json(), None
@@ -83,7 +108,7 @@ def fetch_repo_overview_text(repo: str) -> str:
     try:
         readme_response = requests.get(
             f"{GITHUB_API_BASE}/repos/{repo}/readme",
-            headers={"Accept": "application/vnd.github.v3.raw"},
+            headers=_auth_headers({"Accept": "application/vnd.github.v3.raw"}),
             timeout=_REQUEST_TIMEOUT,
         )
     except requests.RequestException:
@@ -113,6 +138,7 @@ def fetch_repo_source_sample_text(repo: str) -> str:
         tree_response = requests.get(
             f"{GITHUB_API_BASE}/repos/{repo}/git/trees/{default_branch}",
             params={"recursive": "1"},
+            headers=_auth_headers(),
             timeout=_REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
@@ -139,7 +165,7 @@ def fetch_repo_source_sample_text(repo: str) -> str:
         try:
             file_response = requests.get(
                 f"{GITHUB_API_BASE}/repos/{repo}/contents/{path}",
-                headers={"Accept": "application/vnd.github.v3.raw"},
+                headers=_auth_headers({"Accept": "application/vnd.github.v3.raw"}),
                 timeout=_REQUEST_TIMEOUT,
             )
         except requests.RequestException as exc:

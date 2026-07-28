@@ -205,3 +205,68 @@ def test_fetch_repo_source_sample_tool_invoke(mock_github_get):
     result = fetch_repo_source_sample.invoke({"repo": "octocat/does-not-exist"})
 
     assert result.startswith("Error")
+
+
+# ---------------------------------------------------------------------------
+# GITHUB_TOKEN 인증: 있으면 Authorization 헤더를 붙이고, 없으면 그대로
+# 비인증으로 호출한다(기존 동작 유지).
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_repo_overview_text_adds_auth_header_when_token_set(mock_github_get, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token-123")
+    fake = mock_github_get([FakeResponse(404)])
+
+    fetch_repo_overview_text("octocat/does-not-exist")
+
+    _, kwargs = fake.calls[0]
+    assert kwargs["headers"]["Authorization"] == "Bearer test-token-123"
+
+
+def test_fetch_repo_overview_text_omits_auth_header_when_token_unset(mock_github_get, monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    fake = mock_github_get([FakeResponse(404)])
+
+    fetch_repo_overview_text("octocat/does-not-exist")
+
+    _, kwargs = fake.calls[0]
+    assert "Authorization" not in kwargs["headers"]
+
+
+def test_fetch_repo_source_sample_text_adds_auth_header_to_every_call_when_token_set(
+    mock_github_get, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token-123")
+    fake = mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main"}),
+            FakeResponse(200, json_data={"tree": [{"path": "main.py", "type": "blob"}]}),
+            FakeResponse(200, text="print('hi')"),
+        ]
+    )
+
+    fetch_repo_source_sample_text("octocat/hello-world")
+
+    assert len(fake.calls) == 3
+    for _, kwargs in fake.calls:
+        assert kwargs["headers"]["Authorization"] == "Bearer test-token-123"
+
+
+def test_fetch_repo_overview_text_readme_request_keeps_accept_header_with_token(
+    mock_github_get, monkeypatch
+):
+    # Authorization 헤더를 추가하면서 기존 Accept 헤더(raw 콘텐츠 요청용)를
+    # 실수로 덮어쓰지 않는지 확인한다.
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token-123")
+    fake = mock_github_get(
+        [
+            FakeResponse(200, json_data={"full_name": "octocat/hello-world"}),
+            FakeResponse(200, text="README"),
+        ]
+    )
+
+    fetch_repo_overview_text("octocat/hello-world")
+
+    _, readme_kwargs = fake.calls[1]
+    assert readme_kwargs["headers"]["Accept"] == "application/vnd.github.v3.raw"
+    assert readme_kwargs["headers"]["Authorization"] == "Bearer test-token-123"
