@@ -11,10 +11,15 @@ requests.get을 큐 기반 더미로 교체해서 검증한다. 각 도구는 (1
 import requests
 
 from agent.tools import (
+    _extract_signatures,
+    fetch_repo_file,
+    fetch_repo_file_text,
     fetch_repo_overview,
     fetch_repo_overview_text,
     fetch_repo_source_sample,
     fetch_repo_source_sample_text,
+    fetch_repo_structure,
+    fetch_repo_structure_text,
 )
 from tests.conftest import FakeResponse
 
@@ -423,6 +428,194 @@ def test_discover_source_candidates_bounds_directory_listing_calls(mock_github_g
 
 
 # ---------------------------------------------------------------------------
+# _extract_signatures: 함수/클래스 선언부만 뽑는 언어별 휴리스틱
+# ---------------------------------------------------------------------------
+
+
+def test_extract_signatures_python_keeps_def_and_class_drops_body():
+    content = (
+        "import os\n"
+        "\n"
+        "class Foo:\n"
+        "    def bar(self, x):\n"
+        "        return x + 1\n"
+        "\n"
+        "async def baz():\n"
+        "    pass\n"
+    )
+
+    result = _extract_signatures(content, ".py")
+
+    assert "class Foo:" in result
+    assert "def bar(self, x):" in result
+    assert "async def baz():" in result
+    assert "return x + 1" not in result
+    assert "import os" not in result
+
+
+def test_extract_signatures_javascript_keeps_function_and_class():
+    content = (
+        "import x from 'y';\n"
+        "export function foo(a, b) {\n"
+        "  return a + b;\n"
+        "}\n"
+        "class Bar {}\n"
+        "const baz = (x) => x * 2;\n"
+    )
+
+    result = _extract_signatures(content, ".js")
+
+    assert "export function foo(a, b) {" in result
+    assert "class Bar {}" in result
+    assert "const baz = (x) => x * 2;" in result
+    assert "return a + b;" not in result
+
+
+def test_extract_signatures_go_keeps_func_and_type():
+    content = "package main\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"
+
+    result = _extract_signatures(content, ".go")
+
+    assert "func Add(a, b int) int {" in result
+    assert "return a + b" not in result
+
+
+def test_extract_signatures_unsupported_extension_returns_empty():
+    assert _extract_signatures("int main() { return 0; }", ".c") == ""
+
+
+# ---------------------------------------------------------------------------
+# fetch_repo_structure_text: 넓게 훑되 시그니처만 담은 구조 지도
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_repo_structure_text_success(mock_github_get):
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main", "language": "Python"}),
+            FakeResponse(200, json_data=[_file_entry("main.py")]),  # 루트
+            FakeResponse(200, text="def main():\n    print('hi')\n"),
+        ]
+    )
+
+    result = fetch_repo_structure_text("octocat/hello-world")
+
+    assert "### main.py" in result
+    assert "def main():" in result
+    assert "print('hi')" not in result  # 본문은 빠지고 시그니처만 남는다
+
+
+def test_fetch_repo_structure_text_covers_more_files_than_source_sample(mock_github_get):
+    # fetch_repo_source_sample은 최대 3개만 보지만, fetch_repo_structure는
+    # 시그니처만 보내는 대신 더 많은 파일(_MAX_STRUCTURE_FILES=10)을 훑는다.
+    files = [_file_entry(f"m{i}.py") for i in range(10)]
+    mock_github_get(
+        [FakeResponse(200, json_data={"default_branch": "main", "language": "Python"})]
+        + [FakeResponse(200, json_data=files)]
+        + [FakeResponse(200, text=f"def f{i}(): pass") for i in range(10)]
+    )
+
+    result = fetch_repo_structure_text("octocat/hello-world")
+
+    assert result.count("### ") == 10
+
+
+def test_fetch_repo_structure_text_skips_files_with_no_extractable_signatures(
+    mock_github_get,
+):
+    # .c는 시그니처 추출 미지원 확장자라 화이트리스트(_SOURCE_EXTENSIONS)에
+    # 없어서 애초에 후보에도 안 들어간다 — 대신 지원 확장자인데 실제로
+    # 시그니처가 안 뽑히는 경우(예: 본문에 정규식이 못 잡는 형태만 있음)를
+    # 흉내내려면 지원 확장자 파일의 내용 자체를 빈 것처럼 만들면 된다.
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main", "language": "Python"}),
+            FakeResponse(200, json_data=[_file_entry("data.py")]),
+            FakeResponse(200, text="x = 1\ny = 2\n"),  # def/class 없음
+        ]
+    )
+
+    result = fetch_repo_structure_text("octocat/hello-world")
+
+    assert "찾지 못했습니다" in result
+
+
+def test_fetch_repo_structure_text_repo_not_found(mock_github_get):
+    mock_github_get([FakeResponse(404)])
+
+    result = fetch_repo_structure_text("octocat/does-not-exist")
+
+    assert result.startswith("Error")
+
+
+def test_fetch_repo_structure_text_no_matching_files(mock_github_get):
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main"}),
+            FakeResponse(200, json_data=[_file_entry("README.md")]),
+        ]
+    )
+
+    result = fetch_repo_structure_text("octocat/hello-world")
+
+    assert "찾지 못했습니다" in result
+
+
+# ---------------------------------------------------------------------------
+# fetch_repo_file_text: 사용자가 콕 집은 파일 하나의 전체 내용(드릴다운)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_repo_file_text_success(mock_github_get):
+    fake = mock_github_get([FakeResponse(200, text="print('hello')")])
+
+    result = fetch_repo_file_text("octocat/hello-world", "main.py")
+
+    assert result == "### main.py\n```\nprint('hello')\n```"
+    # 특정 파일을 콕 집어 조회하는 것이므로, 메타데이터/디렉토리 탐색 없이
+    # 파일 내용 조회 1번으로 끝나야 한다.
+    assert len(fake.calls) == 1
+
+
+def test_fetch_repo_file_text_rejects_invalid_repo_format(mock_github_get):
+    fake = mock_github_get([])
+
+    result = fetch_repo_file_text("not-a-valid-repo", "main.py")
+
+    assert result.startswith("Error")
+    assert fake.calls == []
+
+
+def test_fetch_repo_file_text_requires_path(mock_github_get):
+    fake = mock_github_get([])
+
+    result = fetch_repo_file_text("octocat/hello-world", "")
+
+    assert result.startswith("Error")
+    assert fake.calls == []
+
+
+def test_fetch_repo_file_text_not_found(mock_github_get):
+    result_fake = mock_github_get([FakeResponse(404)])
+
+    result = fetch_repo_file_text("octocat/hello-world", "does/not/exist.py")
+
+    assert result.startswith("Error")
+    assert "찾을 수 없습니다" in result
+    assert len(result_fake.calls) == 1
+
+
+def test_fetch_repo_file_text_truncates_large_files(mock_github_get):
+    mock_github_get([FakeResponse(200, text="x" * 20000)])
+
+    result = fetch_repo_file_text("octocat/hello-world", "big.py")
+
+    # 헤더/코드펜스를 빼고 본문만 세면 상한(_MAX_SINGLE_FILE_CHARS=8000)과 같아야 한다.
+    body = result.split("```\n", 1)[1].rsplit("\n```", 1)[0]
+    assert len(body) == 8000
+
+
+# ---------------------------------------------------------------------------
 # @tool 래퍼: .invoke()로도 정상 동작해야 한다
 # ---------------------------------------------------------------------------
 
@@ -439,6 +632,22 @@ def test_fetch_repo_source_sample_tool_invoke(mock_github_get):
     mock_github_get([FakeResponse(404)])
 
     result = fetch_repo_source_sample.invoke({"repo": "octocat/does-not-exist"})
+
+    assert result.startswith("Error")
+
+
+def test_fetch_repo_structure_tool_invoke(mock_github_get):
+    mock_github_get([FakeResponse(404)])
+
+    result = fetch_repo_structure.invoke({"repo": "octocat/does-not-exist"})
+
+    assert result.startswith("Error")
+
+
+def test_fetch_repo_file_tool_invoke(mock_github_get):
+    mock_github_get([FakeResponse(404)])
+
+    result = fetch_repo_file.invoke({"repo": "octocat/hello-world", "path": "main.py"})
 
     assert result.startswith("Error")
 

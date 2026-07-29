@@ -5,12 +5,13 @@ route_after_dispatcher는 LLM을 전혀 호출하지 않는 순수 함수다 —
 반환한 마지막 메시지만 보고 다음에 실행할 노드 이름(들)을 반환한다. 그래서
 FakeChatModel조차 필요 없이, AIMessage를 직접 손으로 만들어서 검증한다.
 
-이 프로젝트는 dispatcher -> [repo_overview_node, repo_source_node]
-(팬아웃) -> voter 팬아웃 -> vote_for_best_report -> END 구조를 쓴다.
-dispatcher가 tool_call을 하나만 냈어도 두 노드를 모두 리스트로 반환해서
-"항상 둘 다 병렬로 깨우고, 자기 담당이 아니면 조용히 통과한다"는 원칙을
-지킨다 — add_edge(FANOUT_TOOL_NODES, voter_node) 형태의 팬인 조인은 두
-노드가 매번 함께 실행되어야만 데드락 없이 동작하기 때문이다.
+이 프로젝트는 dispatcher -> [repo_overview_node, repo_source_node,
+repo_structure_node, repo_file_node] (팬아웃) -> voter 팬아웃 ->
+vote_for_best_report -> END 구조를 쓴다. dispatcher가 tool_call을
+하나만 냈어도 네 노드를 모두 리스트로 반환해서 "항상 넷 다 병렬로 깨우고,
+자기 담당이 아니면 조용히 통과한다"는 원칙을 지킨다 —
+add_edge(FANOUT_TOOL_NODES, voter_node) 형태의 팬인 조인은 네 노드가
+매번 함께 실행되어야만 데드락 없이 동작하기 때문이다.
 
 dispatcher -> 팬아웃 -> voter 팬아웃 -> vote -> END는 사이클이 없는
 구조라(voter는 도구가 바인딩되지 않은 llm을 쓰므로 구조적으로 다시
@@ -54,6 +55,12 @@ def test_routes_to_end_when_no_tool_call():
     assert route_after_dispatcher(state) == END
 
 
-def test_fanout_has_two_specialized_tool_nodes():
-    # 개요(overview) / 소스 코드(source)로 역할이 세분화된 2-way 팬아웃이어야 한다.
-    assert FANOUT_TOOL_NODES == ["repo_overview_node", "repo_source_node"]
+def test_fanout_has_four_specialized_tool_nodes():
+    # 개요(overview) / 소스 코드(source) / 구조 지도(structure) / 특정
+    # 파일(file)로 역할이 세분화된 4-way 팬아웃이어야 한다.
+    assert FANOUT_TOOL_NODES == [
+        "repo_overview_node",
+        "repo_source_node",
+        "repo_structure_node",
+        "repo_file_node",
+    ]

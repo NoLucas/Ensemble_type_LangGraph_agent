@@ -5,20 +5,24 @@ main.py의 make_llm()/extract_text()를 그대로 재사용한다. 오케스트�
 로직(build_graph)은 agent/ 패키지에만 있고, 이 파일은 그걸 Chainlit 채팅
 UI로 보여주는 인터페이스일 뿐이다.
 
-app.py(Streamlit)와의 차이는 도구 실행 과정을 보여주는 방식이다: 여기서는
-graph.invoke() 대신 graph.stream(..., stream_mode="updates")로 그래프를
-한 번만 실행하면서, 도구 노드(repo_overview_node/repo_source_node)가
-반환한 결과를 cl.Step으로 실시간 시각화한다. invoke()와 stream()을 각각
-호출하면 그래프가 두 번 실행되어 LLM 호출 비용이 두 배가 되므로, stream()
-결과만으로 최종 상태를 직접 재구성한다(_merge_update).
+app.py(Streamlit)와의 차이는 두 가지다:
+1. 도구 실행 과정을 보여주는 방식 — graph.invoke() 대신 graph.stream(...,
+   stream_mode="updates")로 그래프를 한 번만 실행하면서, 도구 노드
+   (repo_overview_node/repo_source_node/repo_structure_node/repo_file_node)
+   가 반환한 결과를 cl.Step으로 실시간 시각화한다. invoke()와 stream()을
+   각각 호출하면 그래프가 두 번 실행되어 LLM 호출 비용이 두 배가 되므로,
+   stream() 결과만으로 최종 상태를 직접 재구성한다(_merge_update).
+2. 스터디 모드 토글 — cl.ChatSettings로 세션 중에 켜고 끌 수 있고,
+   그래프도 프로세스 전역이 아니라 세션별로 캐시한다(get_graph()).
 """
 
 import chainlit as cl
 import sniffio
+from chainlit.input_widget import Switch
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from agent.graph import build_graph
-from main import extract_text, make_llm
+from main import NORMAL_NUM_VOTERS, STUDY_MODE_NUM_VOTERS, extract_text, make_llm
 
 # chainlit run은 시작할 때 nest_asyncio.apply()로 이벤트 루프를 재진입
 # 가능하게 패치하는데, 이 패치가 asyncio.current_task() 기반 태스크 추적을
@@ -39,17 +43,26 @@ sniffio.current_async_library_cvar.set("asyncio")
 TOOL_STEP_LABELS = {
     "repo_overview_node": "📋 저장소 개요",
     "repo_source_node": "🔍 소스 코드 발췌",
+    "repo_structure_node": "🗺️ 구조 지도",
+    "repo_file_node": "📄 특정 파일",
 }
-
-_graph = None
 
 
 def get_graph():
-    """그래프를 프로세스당 한 번만 조립해서 재사용한다(요청마다 다시 만들지 않는다)."""
-    global _graph
-    if _graph is None:
-        _graph = build_graph(make_llm())
-    return _graph
+    """세션별로 그래프를 한 번만 조립해서 재사용한다.
+
+    num_voters(스터디 모드 여부)는 사용자가 채팅 설정에서 세션 중에 바꿀 수
+    있으므로, 프로세스 전역이 아니라 세션(cl.user_session)에 캐시한다 —
+    설정이 바뀌면 on_settings_update가 이 캐시를 지워서 다음 메시지 때
+    새 num_voters로 다시 조립되게 한다.
+    """
+    graph = cl.user_session.get("graph")
+    if graph is None:
+        study_mode = cl.user_session.get("study_mode", False)
+        num_voters = STUDY_MODE_NUM_VOTERS if study_mode else NORMAL_NUM_VOTERS
+        graph = build_graph(make_llm(), num_voters=num_voters)
+        cl.user_session.set("graph", graph)
+    return graph
 
 
 def _merge_update(state: dict, update: dict) -> None:
@@ -98,14 +111,42 @@ async def on_chat_start():
     # 그 정규화 과정을 거치지 않는다 — 튜플을 남겨두면 다음 턴에 리스트 중간에
     # Message가 아닌 튜플이 섞여 add_messages의 id 기반 처리와 어긋날 수 있다.
     cl.user_session.set("agent_state", {"messages": [], "iteration": 0, "report_drafts": []})
+
+    settings = await cl.ChatSettings(
+        [
+            Switch(
+                id="study_mode",
+                label="스터디 모드 (토큰 절약)",
+                initial=False,
+                description=(
+                    "다수결 검증(voter 3개) 대신 voter 1개만 써서 LLM 호출을 "
+                    "절반 이하로 줄입니다. 대형 저장소를 가볍게 훑어보며 공부할 "
+                    "때 추천합니다."
+                ),
+            ),
+        ]
+    ).send()
+    cl.user_session.set("study_mode", settings["study_mode"])
+
     await cl.Message(
         content=(
             "🔎 GitHub 저장소 리뷰 에이전트입니다.\n\n"
             "리뷰할 저장소를 `owner/repo` 형식으로 알려주세요 "
             "(예: `langchain-ai/langgraph 리뷰해줘`). "
-            "저장소를 여러 개 언급하면 병렬로 처리됩니다."
+            "저장소를 여러 개 언급하면 병렬로 처리됩니다.\n\n"
+            "⚙️ 오른쪽 위 설정에서 **스터디 모드**를 켜면 다수결 검증 없이 "
+            "voter 1개만 써서 토큰을 아낍니다 — '구조만 보여줘'로 가볍게 훑고, "
+            "관심 파일을 콕 집어 드릴다운해보세요."
         )
     ).send()
+
+
+@cl.on_settings_update
+async def on_settings_update(settings):
+    cl.user_session.set("study_mode", settings["study_mode"])
+    # num_voters가 바뀌었을 수 있으므로 캐시된 그래프를 무효화한다 —
+    # get_graph()가 다음 메시지 때 새 num_voters로 다시 조립한다.
+    cl.user_session.set("graph", None)
 
 
 @cl.on_message

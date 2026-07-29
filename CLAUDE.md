@@ -4,7 +4,7 @@
 
 ## 프로젝트 한 줄 요약
 
-LangGraph 기반 **GitHub 저장소 리뷰 에이전트**. TDD(Red-Green-Refactor)로 개발됨. 대화에서 언급된 `owner/repo` 저장소의 개요(README)와 대표 소스 코드를 GitHub REST API(기본 비인증, `GITHUB_TOKEN` 설정 시 자동 인증)로 병렬 팬아웃 조회하고, 최종 리뷰(요약 + 코드 리뷰)는 **같은 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블** 구조.
+LangGraph 기반 **GitHub 저장소 리뷰/학습 에이전트**. TDD(Red-Green-Refactor)로 개발됨. 대화에서 언급된 `owner/repo` 저장소의 개요(README)·구조·소스 코드를 GitHub REST API(기본 비인증, `GITHUB_TOKEN` 설정 시 자동 인증)로 병렬 팬아웃 조회하고, 최종 답변은 **같은 과제를 여러 번(기본 3번) 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블** 구조. "정식 리뷰"(`fetch_repo_source_sample`, 토큰 많이 씀)와 **스터디 모드**("구조 먼저, 필요한 파일만 나중에" — `fetch_repo_structure`+`fetch_repo_file`, 토큰 적게 씀 + `num_voters=1`로 다수결도 생략)를 지원 — 무료 티어처럼 토큰이 빠듯할 때 대형 저장소를 공부할 수 있게 하려는 목적.
 
 ## 이 저장소와 자매 저장소 (역사적 배경, 현재는 목적이 갈림)
 
@@ -27,14 +27,15 @@ LangGraph 기반 **GitHub 저장소 리뷰 에이전트**. TDD(Red-Green-Refacto
           │
    tool_call 있음
           │
-   ┌──────┴──────┐
-   ▼             ▼                       (도구 팬아웃 — 정적 2-way)
-repo_overview_node  repo_source_node
-   └──────┬──────┘
+   ┌──────┼───────┬───────┐
+   ▼      ▼       ▼       ▼               (도구 팬아웃 — 정적 4-way)
+repo_overview  repo_source  repo_structure  repo_file
+_node          _node        _node           _node
+   └──────┼───────┴───────┘
           ▼
    ┌──────┼───────────────┬──────────┐
-   ▼      ▼               ▼          (투표형 앙상블 팬아웃 — 정적 3-way,
-voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독립 시도)
+   ▼      ▼               ▼          (투표형 앙상블 팬아웃 — 정적 N-way,
+voter_1_node   voter_2_node   voter_3_node   기본 N=3, 스터디 모드 N=1)
    └──────┼───────────────┴──────────┘
           ▼
    vote_for_best_report                (팬인: LLM 재호출 없이 결정론적 다수결)
@@ -45,11 +46,13 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 
 자세한 설명은 [README.md](README.md)를 참고하세요. 핵심만 요약하면:
 
-- **dispatcher**: `fetch_repo_overview`/`fetch_repo_source_sample`를 bind_tools한 llm 사용. 사용자가 언급한 저장소마다 필요한 도구를 한 번에 요청하도록 유도.
+- **dispatcher**: 도구 네 개(`fetch_repo_overview`/`fetch_repo_source_sample`/`fetch_repo_structure`/`fetch_repo_file`)를 bind_tools한 llm 사용. 사용자가 언급한 저장소마다 필요한 도구를 한 번에 요청하도록 유도. "정식 리뷰"(source_sample)와 "가볍게 훑기+드릴다운"(structure→file) 흐름을 사용자 의도로 구분해서 고르도록 `DISPATCHER_SYSTEM_PROMPT`가 안내.
 - **repo_overview_node**: 저장소 메타데이터(설명/언어/stars/forks/topics) + README 발췌(최대 3000자)를 텍스트로 조립.
-- **repo_source_node**: 저장소를 `/repos/{repo}/contents/{path}`로 디렉토리 단위(비재귀) DFS 탐색해서(`_discover_source_candidates()`, 최대 8회 호출) 소스 확장자(.py/.js/.ts/.go/...) 파일 후보를 모으고, `tests`/`vendor`/`node_modules`/`examples` 등 경로와 `_test.go`/`.spec.ts` 등 파일명 패턴(`_looks_like_test_file()`)을 제외한 뒤, `_score_source_candidate()`로 점수(주 언어 일치 +10, 진입점 파일명 +5, 얕은 경로 가산, 빈 파일 -100/적당한 크기 +2)를 매겨 상위 3개의 내용(파일당 최대 1500자)을 가져옴. `/git/trees/{branch}?recursive=1`(저장소 전체를 한 번에 받음)은 더 이상 쓰지 않음 — 이유는 아래 핵심 설계 결정 참고.
-- **voter_1/2/3**: **모두 같은 프롬프트**(`VOTER_SYSTEM_PROMPT`)로 "요약 + 코드 리뷰" 두 섹션을 포함한 리뷰를 독립 시도. 관점을 나누지 않는다 — 다양성은 모델 샘플링 자체의 변동성에서 나온다(실서비스에서는 temperature). bind_tools 안 된 llm이라 구조적으로 도구를 재호출 못 함.
-- **vote_for_best_report**: `llm` 파라미터가 아예 없는 순수 함수. 도구 실행 결과(`ToolMessage`)에서 뽑은 "사실 토큰"(숫자/영문 파일명·식별자/한글 단어)을 candidate가 몇 개나 포함하는지로 채점해 다수결로 선택. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크.
+- **repo_source_node**: 저장소를 `/repos/{repo}/contents/{path}`로 디렉토리 단위(비재귀) DFS 탐색해서(`_discover_source_candidates()`, 최대 8회 호출) 소스 확장자(.py/.js/.ts/.go/...) 파일 후보를 모으고, `tests`/`vendor`/`node_modules`/`examples` 등 경로와 `_test.go`/`.spec.ts` 등 파일명 패턴(`_looks_like_test_file()`)을 제외한 뒤, `_score_source_candidate()`로 점수(주 언어 일치 +10, 진입점 파일명 +5, 얕은 경로 가산, 빈 파일 -100/적당한 크기 +2)를 매겨 상위 3개의 **전체 내용**(파일당 최대 1500자)을 가져옴. `/git/trees/{branch}?recursive=1`(저장소 전체를 한 번에 받음)은 더 이상 쓰지 않음.
+- **repo_structure_node**: `repo_source_node`와 동일한 탐색/채점 로직을 재사용하되, 최대 10개 파일까지 더 넓게 훑고 각 파일은 전체 본문 대신 `_extract_signatures()`(언어별 정규식 휴리스틱)로 뽑은 함수/클래스 시그니처만 담는다 — 스터디 모드 1단계, 토큰을 훨씬 적게 씀.
+- **repo_file_node**: 사용자가 지정한 `path` 하나만 탐색 없이 바로 조회(`fetch_repo_file_text`, API 호출 1번) — 스터디 모드 2단계(드릴다운).
+- **voter_1..voter_N**(기본 N=3, `build_graph(num_voters=)`로 조절): **모두 같은 프롬프트**(`VOTER_SYSTEM_PROMPT`)로 사용자 요청에 맞는 답변(리뷰/구조 설명/특정 파일 설명)을 독립 시도. 관점을 나누지 않는다 — 다양성은 모델 샘플링 자체의 변동성에서 나온다(실서비스에서는 temperature). bind_tools 안 된 llm이라 구조적으로 도구를 재호출 못 함. 두 섹션(요약/코드 리뷰)을 더 이상 강제하지 않음 — 어떤 도구가 호출됐는지에 맞춰 알아서 형식을 정함.
+- **vote_for_best_report**: `llm` 파라미터가 아예 없는 순수 함수. 도구 실행 결과(`ToolMessage`)에서 뽑은 "사실 토큰"(숫자/영문 파일명·식별자/한글 단어)을 candidate가 몇 개나 포함하는지로 채점해 다수결로 선택. 동점이면 `voter_1 → voter_2 → ...` 순서로 타이브레이크. `num_voters=1`이면 다수결 없이 단일 candidate를 그대로 채택(로직은 동일, 그냥 후보가 하나뿐).
 
 ## 핵심 설계 결정 (왜 이렇게 했는지)
 
@@ -65,7 +68,7 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 ## 실행 / 테스트
 
 ```bash
-venv/Scripts/python.exe -m pytest -q        # 58개 테스트 (FakeChatModel + QueuedGet 기반 56개 + 실LLM 통합 2개, 전부 통과해야 정상)
+venv/Scripts/python.exe -m pytest -q        # 81개 테스트 (FakeChatModel + QueuedGet/PathAwareQueuedGet 기반 79개 + 실LLM 통합 2개, 전부 통과해야 정상)
 python main.py                              # 콘솔
 streamlit run app.py                        # Streamlit 웹
 chainlit run chainlit_app.py                # Chainlit 웹 (도구 실행 과정 시각화)
@@ -93,12 +96,22 @@ venv/Scripts/python.exe -m pip install -r requirements.txt
 - **수동 테스트로 실제 버그 발견 및 수정**: `chainlit_app.py`의 `graph.stream(..., stream_mode="updates")` 루프가 `node_output.get(...)`을 호출하는데, 설치된 LangGraph 1.2.9에서는 노드가 아무 것도 반환하지 않으면(`{}`가 아니라) 업데이트 값 자체가 `None`으로 온다 — `repo_overview_node`/`repo_source_node`가 항상 함께 깨워지지만 자기 몫이 없으면 통과하는 설계상 **매 요청마다 발생하는 정상 케이스**인데도 `.get()`이 `NoneType`에서 죽었다. `node_output is None`이면 continue하도록 수정. 이 프로젝트의 FakeChatModel 기반 테스트는 `graph.invoke()`만 검증하고 `graph.stream(stream_mode="updates")`의 실제 반환 모양은 검증하지 않아서 놓쳤던 버그 — 실제 LLM + 실제 브라우저로 돌려보지 않았다면 못 잡았을 것.
 - **`fetch_repo_source_sample`의 파일 선택을 "경로 깊이만"에서 "점수 기반"으로 고도화**: 저장소의 대표 언어(`language` 메타데이터)와 확장자 일치, 진입점 파일명(`main`/`index`/`app`/`__init__` 등), 얕은 경로, 적당한 파일 크기(50~20000바이트, 빈 파일은 사실상 배제)를 점수로 합산해 상위 3개를 고른다(`_score_source_candidate()`). `psf/requests`/`expressjs/express` 등 실제 저장소로 수동 검증하는 과정에서 `examples/`의 데모 `index.js`가 진입점 가산점 때문에 실제 라이브러리 구현(`lib/`)보다 먼저 뽑히는 문제를 발견해 `_SKIP_PATH_PARTS`에 `examples`/`demo`/`sample` 계열을 추가로 제외했다(`bugfix.md` 참고 — 유닛 테스트 픽스처만으로는 못 잡고 실제 저장소로 눈으로 확인해야 드러난 문제).
 - **대형 저장소에서 GitHub 응답이 너무 커서 사실상 리뷰 불가능하던 문제 해결**: `/git/trees/{branch}?recursive=1`(저장소 전체 파일 목록을 한 번에 받음)을 `/repos/{repo}/contents/{path}` 디렉토리 단위 DFS 탐색(`_discover_source_candidates()`)으로 교체했다. 실측: `kubernetes/kubernetes` 10MB/37,390개 항목 → 약 4KB/파일 3개, `torvalds/linux` 17.6MB/71,798개 항목(그나마 `truncated: true`로 일부 누락) → 마찬가지로 가벼워짐. 처음엔 너비 우선(BFS)으로 만들었다가 `kubernetes/kubernetes`로 검증하며 "루트 바로 아래엔 컴포넌트별 얕은 디렉토리만 잔뜩 있고 실제 코드는 몇 단계 안쪽"이라 BFS가 호출 예산(당시 5회)을 옆으로 훑다가 다 쓰고 파일을 하나도 못 찾는 걸 발견 — DFS(+힌트 디렉토리 우선, 예산 8회)로 바꿔서 고쳤다. 이 과정에서 `_test.go`/`.spec.ts` 같은 파일명 기반 테스트 파일(디렉토리 관례가 아니라 명명 관례를 쓰는 언어)이 안 걸러지는 것도 추가로 발견해 `_looks_like_test_file()`로 고쳤다. 회귀 테스트 6개 추가(재귀 트리 엔드포인트 미사용, 호출 횟수 상한, 하위 디렉토리 실패 허용, 깊이 우선 탐색, 테스트 파일명 제외 등).
+- **스터디 모드 + 도구 2개 추가**: 사용자가 "무료 티어라 토큰이 부족한데 대형 저장소를 효과적으로 공부할 방법"을 요청해서 구현했다.
+  - `fetch_repo_structure`(신규): `repo_source_node`와 같은 탐색/채점 로직을 재사용하되 파일을 최대 10개까지 더 넓게 훑고, 전체 본문 대신 `_extract_signatures()`(Python/JS·TS/Go/Rust/Java·Kotlin/Ruby용 정규식 휴리스틱)로 뽑은 함수/클래스 시그니처만 담는다.
+  - `fetch_repo_file`(신규): 사용자가 지정한 `path` 하나만 탐색 없이 바로 조회(`_fetch_file_raw()` 공용 헬퍼로 `fetch_repo_source_sample`과 코드 공유). API 호출이 1번뿐이라 가장 저렴.
+  - `build_graph(llm, num_voters=3)`: voter 개수를 조절 가능하게 만들었다. `num_voters=1`(스터디 모드)이면 다수결 없이 단일 시도를 그대로 채택 — LLM 호출이 4번(dispatcher+voter 3)에서 2번(dispatcher+voter 1)으로 줄어든다. `VOTER_LABELS[:num_voters]`로 슬라이싱만 하면 되고, `vote_for_best_report_node`는 코드 수정 없이도 그대로 동작한다(누락된 라벨은 원래 조용히 건너뛰는 설계였기 때문).
+  - `DISPATCHER_SYSTEM_PROMPT`/`VOTER_SYSTEM_PROMPT`를 4-도구/가변 형식에 맞게 재작성 — voter가 "요약+코드 리뷰" 두 섹션을 항상 강제하지 않고 사용자 요청(구조 지도/특정 파일/포괄적 리뷰)에 맞춰 알아서 형식을 고른다.
+  - `main.py`(콘솔: 시작 시 y/N 프롬프트) / `app.py`(Streamlit: 사이드바 토글, `st.cache_resource`가 `num_voters` 인자별로 캐시 분리) / `chainlit_app.py`(Chainlit: `cl.ChatSettings` + `Switch` 위젯, `on_settings_update`가 세션별 그래프 캐시를 무효화)에 모두 연결.
+  - 테스트: `_extract_signatures` 언어별 4개, `fetch_repo_structure_text`/`fetch_repo_file_text` 정상/실패 케이스, 두 노드 단위 테스트, `num_voters=1` 그래프 E2E, `num_voters` 범위 검증(`ValueError`), 구조+파일 도구 동시 호출 E2E.
+  - **테스트 인프라 개선**: `repo_structure_node`+`repo_file_node`처럼 서로 다른 두 도구 노드가 같은 팬아웃 라운드에서 병렬로(스레드 풀) 각자 여러 번 `requests.get`을 호출하면, 기존 `QueuedGet`(순수 FIFO)은 어느 응답이 어느 노드로 갔는지 보장 못 한다는 걸 발견 — URL 부분 문자열로 매칭하는 `PathAwareQueuedGet`(`mock_github_get_by_path` 픽스처)을 새로 추가했다. 기존 `QueuedGet`에도 `FakeChatModel`과 동일한 이유로 `threading.Lock`을 뒤늦게 추가함(경합 자체를 막을 뿐 순서 뒤섞임은 못 막으므로, 여러 도구 노드가 동시에 여러 번 호출하는 시나리오는 반드시 `PathAwareQueuedGet`을 써야 한다).
 
 ### 아직 안 된 것 / 알려진 한계
 - **체크포인터(SqliteSaver) 미지원**: `agent/graph.py`의 `build_graph()`가 `checkpointer` 파라미터를 받지 않는다. (사용자 확인: 필요 없음.)
 - **GitHub rate limit은 `GITHUB_TOKEN`으로 완화 가능하지만 기본값은 여전히 비인증**: `.env`에 토큰을 넣지 않으면 시간당 60회 제한 그대로다. `README.md`에 발급 방법을 안내해뒀지만, 자동으로 토큰을 발급/설정해주지는 않는다.
 - **투표 로직이 여전히 완벽하지 않음**: 토큰 겹침으로 개선했지만 `_FACT_TOKEN_PATTERN`은 숫자를 아라비아 숫자로만 인식한다(예: stars 수를 "42"가 아니라 "마흔두 개"로 표현하면 못 잡음). 한글 형태소 분석기가 아니라 정규식 기반이라 조사가 붙은 단어("저장소로", "저장소는")는 원형("저장소")과 정확히 일치하지 않으면 놓칠 수 있다(코드 리뷰용 영문 식별자·숫자는 이 문제가 없다).
 - **이 개발 환경(Python 3.14.6)에서 `chainlit run chainlit_app.py`이 그대로는 안 뜬다 → `run_chainlit.py`로 해결**: chainlit의 `chainlit.cli`가 임포트 시점에 `nest_asyncio.apply()`를 무조건 호출하는데, 이 패치가 `asyncio.current_task()` 기반 추적을 깨뜨려서(Python 3.14 + anyio 4.14.2 조합) anyio의 `CancelScope`/`_task_states` 조회가 `TypeError: cannot create weak reference to 'NoneType' object`로 죽는다 — 정적 프론트엔드 자산(SPA index.html/JS 번들)이 전혀 로드되지 않는다. `chainlit_app.py`에 추가한 `sniffio.current_async_library_cvar.set("asyncio")`는 이 문제의 1단계(`sniffio` 오판)만 고치고 근본 원인(`nest_asyncio`가 태스크 추적 자체를 깨는 것)은 남기므로 단독으로는 부족했다. 최종 해법은 프로젝트 루트의 `run_chainlit.py` — `chainlit.cli`가 `nest_asyncio`를 import하기 **전에** `sys.modules["nest_asyncio"]`를 `apply()`가 no-op인 가짜 모듈로 바꿔치기한 뒤 `chainlit.cli.cli()`를 그대로 호출한다. `chainlit run`과 동일한 CLI 인터페이스(`-h`, `--port` 등)를 그대로 지원하면서 문제의 패치 호출만 무력화하는 방식이라, `chainlit run`을 완전히 재구현하는 것보다 훨씬 얇고 안전하다. 실제 브라우저로 "개요만"/"코드 리뷰"/"도구 불필요" 세 시나리오를 이 스크립트로 끝까지 검증했다. (참고: 이 파일은 이 세션에서 예상치 못하게 프로젝트 디렉토리에 이미 생성되어 있었다 — 정확한 생성 경위는 파악하지 못했지만 내용을 직접 검증한 뒤 채택했다.)
+- **[NEW, 미해결] `import chainlit` 자체가 Windows 애플리케이션 제어 정책에 막힘**: 위 `nest_asyncio` 문제와 별개로, `chainlit → literalai → traceloop → opentelemetry otlp grpc exporter → grpc`로 이어지는 텔레메트리 의존성 체인에서 `grpc`의 네이티브 확장(`cygrpc.cp314-win_amd64.pyd`)이 `ImportError: DLL load failed while importing cygrpc: 애플리케이션 제어 정책에서 이 파일을 차단했습니다`로 실패한다(WDAC/AppLocker로 추정). `run_chainlit.py`로도 우회 불가능 — `chainlit.cli` import 자체가 이 시점에 이미 실패한다. 시스템 보안 정책이라 코드로 못 고친다(Claude Code 정책상 시스템 설정 변경 자체도 직접 수행 불가). 스터디 모드 관련 chainlit_app.py 변경사항은 소스 코드 검토(`chainlit.input_widget.Switch`/`ChatSettings` 실제 시그니처를 소스 파일로 직접 대조)로만 검증했고, 실제 브라우저로는 확인 못 했다. 다음 세션에서 이 문제가 사라졌으면 그냥 진행하면 되고, 여전하면 사용자에게 WDAC 예외 등록을 요청하거나 `pip uninstall grpcio`로 텔레메트리 경로 자체를 없애는 시도를 해볼 것(단 chainlit/literalai가 grpc를 선택적으로 다루는지는 미검증).
+- **[NEW] `.env`의 `ANTHROPIC_API_KEY`가 현재 무효(401 invalid x-api-key)**: `test_integration.py` 2개와 `main.py`/`app.py`를 통한 실LLM 수동 검증이 막혀 있다. 사용자가 이전에 채팅에 노출된 키를 폐기했을 가능성이 높다(이 세션 초반에 그렇게 권장한 바 있음) — 유효한 키로 교체 필요.
 
 ## 관련 문서
 - [README.md](README.md) — 사용자 대상 설명 (구조, 도구, 설치법)

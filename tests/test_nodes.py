@@ -43,8 +43,10 @@ from agent.nodes import (
     VOTER_SYSTEM_PROMPT,
     call_dispatcher_model,
     call_report_draft_model,
+    repo_file_node,
     repo_overview_node,
     repo_source_node,
+    repo_structure_node,
     vote_for_best_report_node,
 )
 from tests.conftest import FakeResponse
@@ -367,5 +369,85 @@ def test_repo_source_node_passes_through_when_no_matching_tool_call():
     state = {"messages": [HumanMessage(content="리뷰해줘"), ai_message], "iteration": 1}
 
     result = repo_source_node(state)
+
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# repo_structure_node: fetch_repo_structure tool_call만 담당, 나머지는 통과
+# ---------------------------------------------------------------------------
+
+
+def test_repo_structure_node_executes_matching_tool_call(mock_github_get):
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"default_branch": "main"}),
+            FakeResponse(200, json_data=[{"path": "main.py", "type": "file", "size": 500}]),
+            FakeResponse(200, text="def main():\n    pass\n"),
+        ]
+    )
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "fetch_repo_structure", "args": {"repo": "octocat/hello-world"}, "id": "call_3"}
+        ],
+    )
+    state = {"messages": [HumanMessage(content="구조만 훑어줘"), ai_message], "iteration": 1}
+
+    result = repo_structure_node(state)
+
+    assert len(result["messages"]) == 1
+    tool_message = result["messages"][0]
+    assert "def main():" in tool_message.content
+    assert tool_message.tool_call_id == "call_3"
+
+
+def test_repo_structure_node_passes_through_when_no_matching_tool_call():
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[{"name": "fetch_repo_overview", "args": {"repo": "a/b"}, "id": "call_1"}],
+    )
+    state = {"messages": [HumanMessage(content="구조만 훑어줘"), ai_message], "iteration": 1}
+
+    result = repo_structure_node(state)
+
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# repo_file_node: fetch_repo_file tool_call만 담당, 나머지는 통과
+# ---------------------------------------------------------------------------
+
+
+def test_repo_file_node_executes_matching_tool_call(mock_github_get):
+    mock_github_get([FakeResponse(200, text="print('hi')")])
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "fetch_repo_file",
+                "args": {"repo": "octocat/hello-world", "path": "main.py"},
+                "id": "call_4",
+            }
+        ],
+    )
+    state = {"messages": [HumanMessage(content="main.py 자세히 보여줘"), ai_message], "iteration": 1}
+
+    result = repo_file_node(state)
+
+    assert len(result["messages"]) == 1
+    tool_message = result["messages"][0]
+    assert "print('hi')" in tool_message.content
+    assert tool_message.tool_call_id == "call_4"
+
+
+def test_repo_file_node_passes_through_when_no_matching_tool_call():
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[{"name": "fetch_repo_overview", "args": {"repo": "a/b"}, "id": "call_1"}],
+    )
+    state = {"messages": [HumanMessage(content="리뷰해줘"), ai_message], "iteration": 1}
+
+    result = repo_file_node(state)
 
     assert result == {}

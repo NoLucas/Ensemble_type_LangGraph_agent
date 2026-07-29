@@ -2,22 +2,32 @@
 그래프 노드 로직.
 
 이 에이전트는 model 노드 하나가 아니라 역할이 다른 LLM 노드들을 쓰는
-dispatcher -> [repo_overview_node, repo_source_node] (도구 팬아웃) ->
-[voter_1_node, voter_2_node, voter_3_node] (투표형 앙상블 팬아웃) ->
+dispatcher -> [repo_overview_node, repo_source_node, repo_structure_node,
+repo_file_node] (도구 팬아웃) -> [voter_1_node, ..., voter_N_node]
+(투표형 앙상블 팬아웃, N은 build_graph의 num_voters) ->
 vote_for_best_report_node (팬인) -> END 구조다.
 
 - dispatcher(call_dispatcher_model): 사용자가 언급한 GitHub 저장소
-  (owner/repo)를 리뷰하기 위해 fetch_repo_overview/fetch_repo_source_sample
-  두 도구 중 필요한 것을 정확하고 효율적으로 지시하는 역할. 저장소가
-  여러 개 언급되면 한 번에 다 요청하도록 프롬프트로 유도해서, 팬아웃이
-  실제로 병렬 이득을 보게 만든다.
-- voter 3개(call_report_draft_model): 도구 실행이 끝난 뒤, **동일한
-  프롬프트(VOTER_SYSTEM_PROMPT)**로 저장소 리뷰(요약 + 코드 리뷰)를 각자
-  독립적으로 3번 시도하는 역할. "같은 과제를 여러 번 독립 시도해서 다수결로
-  검증"하는 투표(voting) 앙상블이다 — 실제 서비스에서는 모델 샘플링의
-  자연스러운 변동성(temperature)이 다양성의 원천이 된다. 각 voter는
-  바인딩되지 않은 llm을 받아 도구를 다시 호출할 수 없다.
-- vote_for_best_report_node: 세 voter의 독립 시도 중, **도구 실행 결과
+  (owner/repo)를 리뷰/학습하기 위해 도구 네 개(fetch_repo_overview,
+  fetch_repo_source_sample, fetch_repo_structure, fetch_repo_file) 중
+  필요한 것을 정확하고 효율적으로 지시하는 역할. 저장소가 여러 개
+  언급되면 한 번에 다 요청하도록 프롬프트로 유도해서, 팬아웃이 실제로
+  병렬 이득을 보게 만든다. "정식 리뷰"(fetch_repo_source_sample, 토큰
+  많이 씀)와 "가볍게 훑어보기"(fetch_repo_structure, 토큰 적게 씀 →
+  fetch_repo_file로 관심 파일만 드릴다운) 두 흐름을 사용자 의도에 맞게
+  구분해서 고른다 — 대형 저장소를 무료 티어 토큰 예산으로도 공부할 수
+  있게 하려는 목적이다.
+- voter N개(call_report_draft_model, 기본 3개 — build_graph의 num_voters로
+  줄일 수 있다): 도구 실행이 끝난 뒤, **동일한 프롬프트(VOTER_SYSTEM_PROMPT)**
+  로 사용자 요청에 맞는 답변(리뷰/구조 설명/특정 파일 설명 등)을 각자
+  독립적으로 여러 번 시도하는 역할. "같은 과제를 여러 번 독립 시도해서
+  다수결로 검증"하는 투표(voting) 앙상블이다 — 실제 서비스에서는 모델
+  샘플링의 자연스러운 변동성(temperature)이 다양성의 원천이 된다. 각
+  voter는 바인딩되지 않은 llm을 받아 도구를 다시 호출할 수 없다. num_voters=1
+  (스터디 모드)이면 다수결 없이 그 한 번의 시도가 그대로 채택된다 — LLM
+  호출이 4번(dispatcher+voter 3)에서 2번(dispatcher+voter 1)으로 줄어
+  토큰을 절반 이하로 아낀다.
+- vote_for_best_report_node: voter들의 독립 시도 중, **도구 실행 결과
   (ToolMessage 내용)를 실제로 정확히 포함한 candidate만 통과**시키고 그중
   하나를 결정론적 규칙으로 고르는 함수. "어느 게 더 그럴듯한가"를 LLM
   판사에게 다시 묻지 않는다 — 정답(도구 결과: 저장소 개요/소스 코드)을 이미
@@ -26,8 +36,8 @@ vote_for_best_report_node (팬인) -> END 구조다.
   시그니처에 llm 파라미터 자체가 없어서, "종합 단계에서 LLM이 새 내용을
   지어내는" 환각 경로가 구조적으로 존재하지 않는다.
 
-dispatcher가 tool_call을 하나만 냈어도 두 도구 노드를 항상 함께 깨우고,
-자기 담당이 아닌 노드는 조용히 통과(pass-through)한다. voter 3개도 마찬가지로
+dispatcher가 tool_call을 하나만 냈어도 네 도구 노드를 항상 함께 깨우고,
+자기 담당이 아닌 노드는 조용히 통과(pass-through)한다. voter들도 마찬가지로
 tool 팬인 이후 항상 함께 실행된다. 이렇게 해야 graph.py의 list 기반
 add_edge(...) 팬인 조인들이 데드락 없이 동작한다 (조인은 나열된 노드가
 "이번 라운드에 모두 실행됐는지"를 기준으로 트리거되므로, 하나라도 조건부로
@@ -50,7 +60,12 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
 from agent.state import AgentState
-from agent.tools import fetch_repo_overview, fetch_repo_source_sample
+from agent.tools import (
+    fetch_repo_file,
+    fetch_repo_overview,
+    fetch_repo_source_sample,
+    fetch_repo_structure,
+)
 
 # vote_for_best_report_node가 "사실 일치"를 판정할 때 쓰는 토큰 추출 패턴.
 # 세 그룹으로 나뉜다: 숫자(길이 무관, stars 수 등), 영문/경로류(길이 3+,
@@ -61,31 +76,50 @@ from agent.tools import fetch_repo_overview, fetch_repo_source_sample
 _FACT_TOKEN_PATTERN = re.compile(r"\d+|[A-Za-z_./-]{3,}|[가-힣]{2,}")
 
 DISPATCHER_SYSTEM_PROMPT = """당신은 사용자가 언급한 GitHub 저장소(owner/repo
-형식)를 리뷰하기 위해 fetch_repo_overview(저장소 개요/README)와
-fetch_repo_source_sample(대표 소스 코드 발췌) 두 도구 중 필요한 것을 정확하고
-효율적으로 호출 지시하는 디스패처입니다. 저장소를 하나 이상 언급받으면
-일반적으로 두 도구 모두, 각 저장소마다 한 번의 응답에서 모두 요청해서
-병렬로 처리되게 하세요 (도구를 하나씩 순서대로 요청하면 병렬 처리의 이점이
-사라집니다). 리뷰할 저장소가 명확하지 않거나 도구가 전혀 필요 없는 요청이면
-도구를 부르지 말고 바로 답변하세요."""
+형식)를 리뷰하거나 학습하는 데 필요한 도구를 정확하고 효율적으로 호출
+지시하는 디스패처입니다. 사용 가능한 도구는 네 가지입니다:
+- fetch_repo_overview: 저장소 개요/README (가장 저렴, 거의 항상 유용)
+- fetch_repo_structure: 저장소를 넓게 훑어 함수/클래스 시그니처만 담은
+  구조 지도(전체 코드 본문 없음 → 토큰을 훨씬 적게 씀)
+- fetch_repo_source_sample: 대표 소스 파일 몇 개의 전체 내용(정식 코드
+  리뷰용, fetch_repo_structure보다 토큰을 많이 씀)
+- fetch_repo_file: 사용자가 콕 집은 특정 파일 하나의 전체 내용(path 인자
+  필요) — fetch_repo_structure로 구조를 본 뒤 드릴다운할 때 사용
+
+사용자가 "구조만 보고 싶다"/"가볍게 훑어보고 싶다"/"공부하고 싶다"처럼
+가볍게 파악하려는 의도면 fetch_repo_overview + fetch_repo_structure를
+우선 쓰고, 토큰을 더 많이 쓰는 fetch_repo_source_sample은 피하세요.
+사용자가 구조 지도를 본 뒤 특정 파일을 지목하면(예: "app.py 자세히 보여줘")
+fetch_repo_file로 그 파일만 가져오세요. "리뷰해줘"처럼 포괄적인 요청이면
+fetch_repo_overview + fetch_repo_source_sample을 쓰세요. 저장소를 하나
+이상 언급받으면, 필요한 도구를 각 저장소마다 한 번의 응답에서 모두
+요청해서 병렬로 처리되게 하세요 (도구를 하나씩 순서대로 요청하면 병렬
+처리의 이점이 사라집니다). 리뷰할 저장소가 명확하지 않거나 도구가 전혀
+필요 없는 요청이면 도구를 부르지 말고 바로 답변하세요."""
 
 # route_after_dispatcher가 팬아웃할 때 항상 함께 반환하는 노드 이름 목록.
-# 개요(overview) / 소스 코드(source)로 역할을 세분화한 2-way 팬아웃.
-# graph.py의 add_edge(FANOUT_TOOL_NODES, ...) 팬인과 반드시 짝이 맞아야 한다.
-FANOUT_TOOL_NODES = ["repo_overview_node", "repo_source_node"]
+# 개요(overview) / 소스 코드(source) / 구조 지도(structure) / 특정 파일
+# (file)로 역할을 세분화한 4-way 팬아웃. graph.py의
+# add_edge(FANOUT_TOOL_NODES, ...) 팬인과 반드시 짝이 맞아야 한다.
+FANOUT_TOOL_NODES = ["repo_overview_node", "repo_source_node", "repo_structure_node", "repo_file_node"]
 
-# 세 voter가 공유하는 단일 프롬프트. 관점을 나누지 않는다 — 투표형
+# voter들이 공유하는 단일 프롬프트. 관점을 나누지 않는다 — 투표형
 # 앙상블은 "같은 과제를 독립적으로 여러 번 시도"하는 것이지 "다른 역할을
 # 나눠 맡는" 것이 아니다. 다양성은 프롬프트가 아니라 모델 샘플링 자체의
-# 변동성(temperature)에서 나온다.
-VOTER_SYSTEM_PROMPT = """당신은 GitHub 저장소를 리뷰하는 시니어 엔지니어입니다.
-지금까지의 대화와 도구 실행 결과(저장소 개요/README, 소스 코드 발췌)를
-바탕으로, 리뷰 대상 저장소마다 다음 두 섹션을 빠짐없이 포함한 리뷰를
-정리해서 응답하세요:
-1) 요약 — 저장소가 무엇을 하는지, 스택/규모/인기도(설명, 언어, stars 등)
-2) 코드 리뷰 — 가져온 소스 코드 발췌의 구조·스타일·잠재적 버그나 개선점
-도구는 이미 모두 실행됐으니 다시 호출할 필요가 없습니다. 도구 결과에 없는
-내용은 지어내지 마세요."""
+# 변동성(temperature)에서 나온다. 두 섹션(요약/코드 리뷰)을 항상 강제하지
+# 않는다 — fetch_repo_structure/fetch_repo_file처럼 정식 리뷰가 아니라
+# "가볍게 훑기"/"특정 파일 드릴다운" 요청에는 그 형식이 맞지 않기 때문에,
+# 실제로 어떤 도구가 호출됐고 사용자가 무엇을 물었는지에 맞춰 형식을
+# 알아서 정하도록 한다.
+VOTER_SYSTEM_PROMPT = """당신은 GitHub 저장소를 리뷰·설명하는 시니어
+엔지니어입니다. 지금까지의 대화와 도구 실행 결과(저장소 개요/README, 구조
+지도, 소스 코드 발췌, 특정 파일 전체 내용 등 — 실제로 어떤 도구가 호출됐는지에
+따라 다름)를 바탕으로, 사용자가 무엇을 물었는지에 맞춰 답변을 구성하세요.
+"리뷰해줘"처럼 포괄적인 요청이면 요약과 코드 리뷰를 모두 담고, "구조만
+보여줘"/"공부하고 싶다"처럼 가볍게 훑어보려는 요청이면 구조 지도를 이해하기
+쉽게 정리하고, 특정 파일을 물었으면 그 파일 위주로 설명하세요. 도구는 이미
+모두 실행됐으니 다시 호출할 필요가 없습니다. 도구 결과에 없는 내용은 지어내지
+마세요."""
 
 # 세 독립 시도를 구분하는 라벨. 동점일 때 이 순서대로 타이브레이크한다.
 VOTER_LABELS = ["voter_1", "voter_2", "voter_3"]
@@ -191,8 +225,9 @@ def route_after_dispatcher(state: AgentState):
     돌리는 건 불필요한 LLM 호출이기 때문이다.
 
     tool_call이 하나만 요청됐어도 FANOUT_TOOL_NODES 전체를 반환한다 —
-    repo_overview_node/repo_source_node 각각이 자기 몫이 없으면 통과하는
-    방식으로 "항상 둘 다 병렬로 깨운다"는 팬인 조인의 전제를 지킨다.
+    repo_overview_node/repo_source_node/repo_structure_node/repo_file_node
+    각각이 자기 몫이 없으면 통과하는 방식으로 "항상 넷 다 병렬로 깨운다"는
+    팬인 조인의 전제를 지킨다.
     """
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
@@ -232,3 +267,11 @@ def repo_overview_node(state: AgentState) -> dict:
 
 def repo_source_node(state: AgentState) -> dict:
     return _run_matching_tool_calls(state, "fetch_repo_source_sample", fetch_repo_source_sample)
+
+
+def repo_structure_node(state: AgentState) -> dict:
+    return _run_matching_tool_calls(state, "fetch_repo_structure", fetch_repo_structure)
+
+
+def repo_file_node(state: AgentState) -> dict:
+    return _run_matching_tool_calls(state, "fetch_repo_file", fetch_repo_file)

@@ -70,17 +70,28 @@ class QueuedGet:
     """requests.get을 대체하는 더미. 호출될 때마다 큐에서 응답을 하나씩 꺼내
     반환한다. GitHub 도구가 여러 번(메타데이터 -> README/트리 -> 파일 내용)
     순차적으로 requests.get을 호출하므로, URL 매칭 대신 호출 순서로 응답을
-    미리 정해두는 편이 테스트를 단순하게 만든다."""
+    미리 정해두는 편이 테스트를 단순하게 만든다.
+
+    도구 노드 하나가 순차적으로 호출하는 경우에만 안전하다 — 서로 다른 두
+    도구 노드가 그래프의 같은 팬아웃 라운드에서 병렬로(스레드 풀) 각자
+    여러 번 호출하면 두 노드의 호출 순서가 뒤섞이므로, 그런 시나리오는
+    PathAwareQueuedGet(mock_github_get_by_path)을 대신 써야 한다. 락은
+    "두 스레드가 같은 응답을 훔쳐가는" 경합만 막아줄 뿐, 뒤섞인 순서
+    자체는 못 막는다 — FakeChatModel과 동일한 이유(voter 3개 동시 호출)로
+    필요하다.
+    """
 
     def __init__(self, responses: list):
         self._responses = list(responses)
         self.calls: list[tuple] = []
+        self._lock = threading.Lock()
 
     def __call__(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        if not self._responses:
-            raise AssertionError("QueuedGet: 예정된 응답을 모두 소진했습니다.")
-        return self._responses.pop(0)
+        with self._lock:
+            self.calls.append((url, kwargs))
+            if not self._responses:
+                raise AssertionError("QueuedGet: 예정된 응답을 모두 소진했습니다.")
+            return self._responses.pop(0)
 
 
 @pytest.fixture
@@ -90,6 +101,47 @@ def mock_github_get(monkeypatch):
 
     def _install(responses: list) -> QueuedGet:
         fake = QueuedGet(responses)
+        monkeypatch.setattr(tools_module.requests, "get", fake)
+        return fake
+
+    return _install
+
+
+class PathAwareQueuedGet:
+    """requests.get을 대체하는 더미. 호출 순서가 아니라 URL에 포함된 부분
+    문자열로 어느 큐에서 응답을 꺼낼지 정한다.
+
+    QueuedGet(순수 FIFO)은 도구 하나가 순차적으로 여러 번 requests.get을
+    호출하는 경우엔 충분하지만, 서로 다른 두 도구 노드(예: repo_structure_node
+    + repo_file_node)가 그래프의 같은 팬아웃 라운드에서 병렬로(스레드 풀)
+    각자 여러 번 호출하면, 두 노드의 호출이 뒤섞여 들어와 순서를 신뢰할 수
+    없다 — 그래서 "어떤 URL이냐"로 응답을 골라내는 이 클래스가 필요하다.
+    """
+
+    def __init__(self, response_map: dict[str, list]):
+        self._queues = {key: list(values) for key, values in response_map.items()}
+        self._lock = threading.Lock()
+        self.calls: list[tuple] = []
+
+    def __call__(self, url, **kwargs):
+        with self._lock:
+            self.calls.append((url, kwargs))
+            for key, queue in self._queues.items():
+                if key in url and queue:
+                    return queue.pop(0)
+            raise AssertionError(f"PathAwareQueuedGet: {url}에 대해 예정된 응답이 없습니다.")
+
+
+@pytest.fixture
+def mock_github_get_by_path(monkeypatch):
+    """agent.tools.requests.get을 PathAwareQueuedGet으로 교체하는 팩토리 픽스처.
+
+    response_map은 {URL에 포함될 부분 문자열: [FakeResponse, ...]} 형태다.
+    """
+    import agent.tools as tools_module
+
+    def _install(response_map: dict[str, list]) -> PathAwareQueuedGet:
+        fake = PathAwareQueuedGet(response_map)
         monkeypatch.setattr(tools_module.requests, "get", fake)
         return fake
 

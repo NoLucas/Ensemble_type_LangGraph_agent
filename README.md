@@ -1,6 +1,8 @@
 # Ensemble_type_LangGraph_agent
 
-LangGraph 기반 GitHub 저장소 리뷰 에이전트입니다. TDD(Red-Green-Refactor)로 개발되었으며, 사용자가 대화에서 언급한 `owner/repo` 저장소의 개요(README)와 대표 소스 코드를 GitHub API로 가져와 병렬 처리하고, 최종 리뷰(요약 + 코드 리뷰)는 동일한 과제를 3번 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블 구조입니다.
+LangGraph 기반 GitHub 저장소 리뷰/학습 에이전트입니다. TDD(Red-Green-Refactor)로 개발되었으며, 사용자가 대화에서 언급한 `owner/repo` 저장소의 개요(README)·구조·소스 코드를 GitHub API로 가져와 병렬 처리합니다. 최종 답변은 동일한 과제를 여러 번(기본 3회) 독립 시도한 뒤 도구 실행 결과와 실제로 일치하는 답을 결정론적으로 골라 채택하는 투표(voting) 앙상블 구조입니다.
+
+**정식 리뷰**(요약 + 코드 리뷰, 토큰 많이 씀)와 **스터디 모드**(구조 지도만 가볍게 훑고 관심 파일만 드릴다운, 토큰 적게 씀) 두 흐름을 지원합니다 — 무료 티어처럼 토큰이 빠듯한 상태에서도 대형 저장소를 공부할 수 있게 하려는 목적입니다. 자세한 내용은 [스터디 모드](#스터디-모드-토큰-절약) 섹션을 참고하세요.
 
 ## 구조
 
@@ -14,15 +16,16 @@ LangGraph 기반 GitHub 저장소 리뷰 에이전트입니다. TDD(Red-Green-Re
           │
    tool_call 있음
           │
-   ┌──────┴──────┐
-   ▼             ▼                       (도구 팬아웃 — 정적 2-way)
-repo_overview_node  repo_source_node
-   └──────┬──────┘
+   ┌──────┼───────┬───────┐
+   ▼      ▼       ▼       ▼               (도구 팬아웃 — 정적 4-way)
+repo_overview  repo_source  repo_structure  repo_file
+_node          _node        _node           _node
+   └──────┼───────┴───────┘
           ▼
    ┌──────┼───────────────┬──────────┐
-   ▼      ▼               ▼          (투표형 앙상블 팬아웃 — 정적 3-way,
-voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독립 시도)
-   └──────┼───────────────┴──────────┘
+   ▼      ▼               ▼          (투표형 앙상블 팬아웃 — 정적 N-way,
+voter_1_node   voter_2_node   voter_3_node   기본 N=3, 스터디 모드는 N=1,
+   └──────┼───────────────┴──────────┘        다 같은 프롬프트로 독립 시도)
           ▼
    vote_for_best_report                (팬인: LLM 재호출 없이 결정론적 다수결)
           │
@@ -30,10 +33,10 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
          END
 ```
 
-- **dispatcher**: 사용자 입력에서 언급된 GitHub 저장소(`owner/repo`)를 해석해 `fetch_repo_overview`(개요/README) / `fetch_repo_source_sample`(대표 소스 코드) 중 필요한 도구를 지시합니다. 여러 저장소·도구가 필요하면 한 번의 응답에서 모두 요청하도록 유도해 팬아웃이 실제로 병렬 이득을 보게 합니다.
-- **도구 팬아웃/팬인**: 두 도구 노드는 항상 함께 깨워지고, 자기 담당 tool_call이 없으면 조용히 통과(pass-through)합니다.
-- **투표형 앙상블 팬아웃/팬인**: `voter_1`/`voter_2`/`voter_3`는 **모두 같은 프롬프트(`VOTER_SYSTEM_PROMPT`)**로 "요약 + 코드 리뷰" 두 섹션을 포함한 최종 리뷰를 각자 독립적으로 시도합니다. 관점을 나누는 앙상블이 아니라 같은 과제를 여러 번 독립 시도해서 검증하는 투표 앙상블이며, 다양성은 프롬프트가 아니라 모델 샘플링 자체의 변동성(temperature)에서 나옵니다.
-- **vote_for_best_report**: 도구 실행 결과(`ToolMessage`: 저장소 개요/소스 코드)에서 "사실 토큰"(숫자, 영문 파일명/식별자, 한글 단어)을 뽑아, 세 candidate 중 이 토큰을 가장 많이 포함한 것을 **LLM을 다시 호출하지 않고** 결정론적으로 고르는 함수입니다. `ToolMessage` 내용이 수백~수천 자짜리 자유 서술형 텍스트라 voter가 그 블록을 통째로 인용하는 일은 없으므로, "전체 문자열이 그대로 포함되는가"가 아니라 "토큰 단위로 얼마나 겹치는가"로 채점합니다 — voter가 문장을 바꿔 써도(패러프레이즈해도) 숫자/고유명사 같은 사실은 그대로 잡아냅니다. 동점이면 `voter_1 → voter_2 → voter_3` 순서로 타이브레이크하고, 아무도 사실을 못 맞혀도 예외 없이 첫 번째 voter의 답을 반환합니다. "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않으므로, 이 종합 단계에는 환각이 새로 끼어들 여지가 없습니다.
+- **dispatcher**: 사용자 입력에서 언급된 GitHub 저장소(`owner/repo`)를 해석해 도구 네 개(`fetch_repo_overview`/`fetch_repo_source_sample`/`fetch_repo_structure`/`fetch_repo_file`) 중 필요한 것을 지시합니다. "정식 리뷰"인지 "가볍게 훑어보기+드릴다운"인지 사용자 의도에 맞는 조합을 고릅니다. 여러 저장소·도구가 필요하면 한 번의 응답에서 모두 요청하도록 유도해 팬아웃이 실제로 병렬 이득을 보게 합니다.
+- **도구 팬아웃/팬인**: 네 도구 노드는 항상 함께 깨워지고, 자기 담당 tool_call이 없으면 조용히 통과(pass-through)합니다.
+- **투표형 앙상블 팬아웃/팬인**: `voter_1..voter_N`(기본 N=3)은 **모두 같은 프롬프트(`VOTER_SYSTEM_PROMPT`)**로 사용자 요청에 맞는 답변(리뷰/구조 설명/특정 파일 설명)을 각자 독립적으로 시도합니다. 관점을 나누는 앙상블이 아니라 같은 과제를 여러 번 독립 시도해서 검증하는 투표 앙상블이며, 다양성은 프롬프트가 아니라 모델 샘플링 자체의 변동성(temperature)에서 나옵니다. `build_graph(llm, num_voters=1)`(스터디 모드)이면 다수결 없이 그 한 번의 시도가 그대로 채택됩니다.
+- **vote_for_best_report**: 도구 실행 결과(`ToolMessage`)에서 "사실 토큰"(숫자, 영문 파일명/식별자, 한글 단어)을 뽑아, candidate 중 이 토큰을 가장 많이 포함한 것을 **LLM을 다시 호출하지 않고** 결정론적으로 고르는 함수입니다. `ToolMessage` 내용이 수백~수천 자짜리 자유 서술형 텍스트라 voter가 그 블록을 통째로 인용하는 일은 없으므로, "전체 문자열이 그대로 포함되는가"가 아니라 "토큰 단위로 얼마나 겹치는가"로 채점합니다 — voter가 문장을 바꿔 써도(패러프레이즈해도) 숫자/고유명사 같은 사실은 그대로 잡아냅니다. 동점이면 `voter_1 → voter_2 → ...` 순서로 타이브레이크하고, 아무도 사실을 못 맞혀도 예외 없이 첫 번째 voter의 답을 반환합니다. "어느 게 더 그럴듯한가"를 LLM 판사에게 다시 묻지 않으므로, 이 종합 단계에는 환각이 새로 끼어들 여지가 없습니다.
 - **도구가 필요 없으면** dispatcher의 답변이 그대로 최종 답변이 되고, 도구 팬아웃/투표 팬아웃 단계는 아예 실행되지 않습니다 (불필요한 LLM 호출을 만들지 않습니다).
 
 이 그래프는 사이클이 없는 DAG입니다 — `dispatcher`는 tool이 바인딩된 llm을, `voter_*` 노드들은 바인딩되지 않은 llm을 받아서 구조적으로 도구를 다시 호출할 수 없습니다. 그래서 반복 상한(iteration cap) 같은 무한 루프 방지 장치가 필요 없습니다.
@@ -43,11 +46,11 @@ voter_1_node   voter_2_node   voter_3_node   셋 다 같은 프롬프트로 독�
 ```
 agent/
   state.py    # AgentState: messages(add_messages), iteration(operator.add 델타), report_drafts(operator.add)
-  tools.py    # fetch_repo_overview, fetch_repo_source_sample (GitHub REST API, GITHUB_TOKEN 선택적 인증)
+  tools.py    # fetch_repo_overview/source_sample/structure/file (GitHub REST API, GITHUB_TOKEN 선택적 인증)
   nodes.py    # dispatcher/voter/vote_for_best_report 노드, 라우팅 함수, 도구 실행 노드
-  graph.py    # build_graph(llm) — 전체 그래프 조립
+  graph.py    # build_graph(llm, num_voters=3) — 전체 그래프 조립
 tests/
-  conftest.py         # FakeChatModel + mock_github_get(QueuedGet) — 실제 API 호출 없이 결정적 테스트
+  conftest.py         # FakeChatModel + mock_github_get(QueuedGet)/mock_github_get_by_path — 실제 API 호출 없이 결정적 테스트
   test_state.py        # state reducer 테스트
   test_tools.py         # 도구 단위 테스트 (정상/실패 케이스)
   test_nodes.py          # 노드 단위 테스트
@@ -60,7 +63,9 @@ tests/
 | 도구 | 설명 | 안전장치 |
 |---|---|---|
 | `fetch_repo_overview` | 저장소 메타데이터(설명/언어/stars)와 README 발췌 | `owner/repo` 형식 검증, 저장소 없음(404)/rate limit(403)/네트워크 오류를 예외 대신 에러 문자열로 반환 |
-| `fetch_repo_source_sample` | 저장소를 디렉토리 단위로 탐색해 대표 소스 파일 최대 3개의 내용 발췌 | 소스 확장자 화이트리스트, `tests/vendor/node_modules/examples` 등 경로 및 `_test.go`/`.spec.ts` 등 파일명 패턴 제외, 디렉토리 탐색 호출 상한, 파일당/README 길이 상한 |
+| `fetch_repo_source_sample` | 저장소를 디렉토리 단위로 탐색해 대표 소스 파일 최대 3개의 **전체 내용** 발췌 (정식 코드 리뷰용) | 소스 확장자 화이트리스트, `tests/vendor/node_modules/examples` 등 경로 및 `_test.go`/`.spec.ts` 등 파일명 패턴 제외, 디렉토리 탐색 호출 상한, 파일당/README 길이 상한 |
+| `fetch_repo_structure` | 저장소를 훨씬 넓게(최대 10개) 훑되, 파일 본문이 아니라 **함수/클래스 시그니처만** 추출한 구조 지도 (스터디 모드 1단계) | 위와 동일한 탐색/제외 로직 재사용, 시그니처 추출 미지원 확장자는 자동으로 건너뜀 |
+| `fetch_repo_file` | 사용자가 콕 집은 파일 **하나**의 전체 내용 (스터디 모드 2단계, 드릴다운) | `owner/repo` 형식 검증, path 필수, 404/네트워크 오류 처리. 탐색 없이 바로 조회하므로 API 호출이 가장 적음 |
 
 모든 도구는 예외를 던지지 않고 `"Error: ..."` 문자열을 반환합니다 — LLM이 스키마와 맞지 않는 입력을 줄 수 있고 GitHub API도 실패할 수 있으므로, 실패도 정상적인 반환값으로 표현해서 그래프 전체가 죽지 않게 합니다.
 
@@ -79,6 +84,25 @@ tests/
 
 GitHub API는 기본적으로 **비인증으로 호출**합니다(시간당 60회 제한). `.env`에 `GITHUB_TOKEN`을 설정하면 모든 요청에 자동으로 `Authorization: Bearer <GITHUB_TOKEN>` 헤더가 붙어 시간당 5000회로 늘어납니다(`agent/tools.py`의 `_auth_headers()`). 별도 권한이 필요 없는(공개 저장소 읽기 전용) [개인용 액세스 토큰](https://github.com/settings/tokens)이면 충분합니다. 토큰을 설정하지 않으면 기존과 동일하게 비인증으로 동작합니다.
 
+## 스터디 모드 (토큰 절약)
+
+큰 저장소를 리뷰가 아니라 **공부** 목적으로 가볍게 훑어보고 싶을 때, `build_graph(llm, num_voters=1)`로 그래프를 조립하면 다수결 검증(voter 3개) 대신 voter 1개만 씁니다 — LLM 호출이 4번(dispatcher + voter 3)에서 **2번**(dispatcher + voter 1)으로 줄어 토큰을 절반 이하로 아낍니다. 무료 티어처럼 토큰이 빠듯한 상황을 염두에 둔 트레이드오프로, 다수결의 오류 검증 효과는 포기합니다.
+
+세 인터페이스 모두 스터디 모드를 켤 수 있습니다:
+
+| 인터페이스 | 켜는 방법 |
+|---|---|
+| `main.py` (콘솔) | 시작할 때 "스터디 모드로 시작할까요? [y/N]" 프롬프트에 `y` |
+| `app.py` (Streamlit) | 사이드바의 "스터디 모드" 토글 |
+| `chainlit_app.py` (Chainlit) | 오른쪽 위 설정(⚙️)의 "스터디 모드" 스위치 — 대화 중에도 켜고 끌 수 있습니다 |
+
+스터디 모드에서 대형 저장소를 효과적으로 공부하는 흐름은 "구조 먼저, 필요한 파일만 나중에"입니다:
+
+1. **"구조만 보여줘"** — `fetch_repo_overview` + `fetch_repo_structure`만 호출됩니다. 전체 코드 본문 없이 함수/클래스 시그니처만 담은 지도를 최대 10개 파일까지 보여줘서, 코드를 한 줄도 안 읽고도 저장소가 대략 어떻게 생겼는지 감을 잡을 수 있습니다.
+2. **"app.py 자세히 보여줘"** — 구조 지도를 본 뒤 관심 가는 파일을 콕 집으면 `fetch_repo_file`이 그 파일 하나의 전체 내용만 가져옵니다(탐색 없이 바로 조회하므로 API 호출도 가장 적습니다).
+
+dispatcher가 이 흐름을 자동으로 판단합니다(`DISPATCHER_SYSTEM_PROMPT` 참고) — "리뷰해줘"처럼 포괄적인 요청이면 정식 리뷰(`fetch_repo_source_sample`)로, "구조만"/"공부하고 싶다"처럼 가벼운 요청이면 스터디 흐름으로 자동 전환됩니다.
+
 ## 설치 및 테스트
 
 ```bash
@@ -88,7 +112,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-현재 58개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD 56개 + 실LLM 통합 테스트 2개).
+현재 81개 테스트가 전부 통과합니다 (state/tools/nodes/routing/graph E2E 계층별 TDD 79개 + 실LLM 통합 테스트 2개).
 
 느린 테스트(실LLM + 실제 GitHub API 호출)는 `integration` 마커(`tests/test_integration.py`)로 분리되어 있으며 기본 실행에서 제외하는 것을 권장합니다:
 
@@ -102,7 +126,7 @@ pytest -m "not integration"
 pytest -m integration
 ```
 
-`tests/conftest.py`의 `FakeChatModel`은 `threading.Lock`으로 `invoke()`를 보호합니다 — voter 3개가 그래프 실행 중 같은 `FakeChatModel` 인스턴스를 스레드 풀에서 동시에 호출하므로, 락이 없으면 `calls` 증가와 응답 인덱싱이 경합해 테스트가 간헐적으로 실패할 수 있습니다. `mock_github_get`(`QueuedGet`)은 `requests.get`을 호출 순서 기반 더미로 교체해 실제 GitHub API를 타지 않고 도구 로직을 검증합니다.
+`tests/conftest.py`의 `FakeChatModel`/`QueuedGet`은 `threading.Lock`으로 보호됩니다 — voter들이 그래프 실행 중 같은 인스턴스를 스레드 풀에서 동시에 호출하므로, 락이 없으면 경합으로 테스트가 간헐적으로 실패할 수 있습니다. `mock_github_get`(`QueuedGet`)은 호출 순서 기반으로 응답을 내주는 더미라 도구 하나가 순차적으로 여러 번 호출하는 경우에 적합합니다. 서로 다른 두 도구 노드(예: `repo_structure_node`+`repo_file_node`)가 같은 팬아웃 라운드에서 병렬로 각자 여러 번 호출하면 순서를 신뢰할 수 없으므로, 그런 경우엔 URL 부분 문자열로 응답을 매칭하는 `mock_github_get_by_path`(`PathAwareQueuedGet`)를 씁니다.
 
 ## 그래프 사용 예시
 
@@ -111,7 +135,7 @@ from langchain_anthropic import ChatAnthropic
 from agent.graph import build_graph
 
 llm = ChatAnthropic(model="claude-sonnet-5")
-graph = build_graph(llm)
+graph = build_graph(llm)  # 정식 리뷰(voter 3개). 스터디 모드는 num_voters=1
 
 result = graph.invoke({
     "messages": [("human", "langchain-ai/langgraph 요약이랑 코드 리뷰 둘 다 해줘")],
@@ -137,7 +161,7 @@ print(result["messages"][-1].content)
 
 `chainlit run`이 몇몇 환경(`nest_asyncio` + 최신 `anyio` 조합)에서 정적 프론트엔드 자산을 못 띄우고 500 에러만 뱉는 경우, `run_chainlit.py`를 대신 쓰세요 — `chainlit run`과 똑같은 CLI(`-h`, `--port` 등)를 그대로 지원하면서, 문제의 원인인 `nest_asyncio.apply()` 호출만 무해화합니다. 자세한 원인은 `run_chainlit.py`의 모듈 docstring을 참고하세요.
 
-초기 state에는 `report_drafts: []`를 반드시 포함해야 합니다 — 3-way 투표형 앙상블(`voter_1`/`voter_2`/`voter_3`)이 병렬로 채우는 `operator.add` 리듀서 필드라, 첫 병렬 쓰기 전에 채널이 초기화돼 있어야 안전합니다. `chainlit_app.py`처럼 `graph.invoke()` 대신 `graph.stream()`으로 상태를 직접 재구성하는 경우, `iteration`과 `report_drafts` 모두 **델타/리스트를 누적**해야 합니다(마지막 값으로 덮어쓰면 안 됩니다) — 두 필드 모두 `operator.add` 리듀서를 쓰기 때문입니다.
+초기 state에는 `report_drafts: []`를 반드시 포함해야 합니다 — N-way 투표형 앙상블(`voter_1..voter_N`)이 병렬로 채우는 `operator.add` 리듀서 필드라, 첫 병렬 쓰기 전에 채널이 초기화돼 있어야 안전합니다. `chainlit_app.py`처럼 `graph.invoke()` 대신 `graph.stream()`으로 상태를 직접 재구성하는 경우, `iteration`과 `report_drafts` 모두 **델타/리스트를 누적**해야 합니다(마지막 값으로 덮어쓰면 안 됩니다) — 두 필드 모두 `operator.add` 리듀서를 쓰기 때문입니다.
 
 ## 개발 진행 이력 (Chainlit 실행 불가 버그)
 
@@ -185,3 +209,25 @@ print(result["messages"][-1].content)
    Python 3.12 기준으로 남았지만, 실제 버그 원인은 Python 버전이 아니었다는
    점이 이 조사의 핵심 결론이다 — 이후 동일 증상이 재발하면 `nest_asyncio`/
    `anyio`/`uvicorn` 버전 조합부터 의심할 것.
+6. **(정정) venv는 현재 다시 Python 3.14.6이다** — 이후 세션에서 venv가
+   Python 3.12로 손상되어 있는 것을 발견해(경위 불명) 원래대로 3.14.6으로
+   재생성했다. `run_chainlit.py`는 Python 버전과 무관하게(원인이 애초에
+   Python 버전이 아니었으므로) 3.14.6에서도 동일하게 동작을 확인했다.
+7. **새로운 별개 문제 발견: Windows 애플리케이션 제어 정책이 `grpc` 로드를
+   차단** — 위 nest_asyncio 문제와는 무관한 환경 문제를 추가로 발견했다.
+   `import chainlit`이 `chainlit → literalai → traceloop → opentelemetry
+   otlp grpc exporter → grpc`로 이어지는 원격 텔레메트리 의존성 체인을
+   타는데, `grpc`의 네이티브 확장(`cygrpc.cp314-win_amd64.pyd`) 로드가
+   `ImportError: DLL load failed while importing cygrpc: 애플리케이션 제어
+   정책에서 이 파일을 차단했습니다`로 실패한다 — Windows Defender
+   Application Control(WDAC)/AppLocker 같은 시스템 보안 정책이 서명되지
+   않았거나(또는 새로 설치된) DLL의 실행을 막는 것으로 보인다. 이건 코드
+   버그가 아니라 시스템 보안 설정이라 애플리케이션 코드로 우회할 수
+   없다 — Claude Code의 안전 정책상으로도 시스템/보안 설정 변경은 직접
+   수행할 수 없는 영역이다. 이 문제를 겪으면: (a) 시스템 관리자에게 해당
+   DLL 또는 이 프로젝트의 venv 경로를 허용 목록에 추가해달라고 요청하거나,
+   (b) `pip uninstall grpcio grpcio-tools`로 텔레메트리 경로 자체를 없애는
+   방법을 시도해볼 수 있다(단, chainlit/literalai가 grpc를 완전히
+   선택적으로 다루는지는 검증하지 않았다). 이 문제는 `run_chainlit.py`로
+   해결되지 않는다 — `nest_asyncio` 문제와 별개로, `import chainlit` 자체가
+   막히기 때문이다.

@@ -1,17 +1,25 @@
 """
 에이전트가 사용할 도구(tool) 모음.
 
-GitHub 공개 REST API를 사용해서 두 도구를 제공한다:
+GitHub 공개 REST API를 사용해서 네 도구를 제공한다:
 1. fetch_repo_overview: 저장소 메타데이터(설명/언어/스타 수)와 README 발췌.
    "요약 리포트"의 재료가 된다.
 2. fetch_repo_source_sample: 저장소 트리에서 대표 소스 파일 몇 개를 골라
-   내용을 가져온다. "코드 리뷰"의 재료가 된다.
+   전체 내용을 가져온다. 정식 "코드 리뷰"의 재료가 된다.
+3. fetch_repo_structure: 저장소를 fetch_repo_source_sample보다 훨씬 넓게
+   훑되, 파일 전체 본문이 아니라 함수/클래스 시그니처만 추출한다. 큰
+   저장소를 "가볍게 훑어보고 공부"하려는 스터디 모드의 1단계 재료다 —
+   같은 토큰 예산으로 fetch_repo_source_sample보다 훨씬 많은 파일의
+   구조를 보여준다.
+4. fetch_repo_file: 사용자가 콕 집은 파일 하나의 전체 내용을 가져온다.
+   fetch_repo_structure로 구조를 먼저 훑고 나서, 관심 가는 파일 하나만
+   깊게 파고들 때(드릴다운) 쓰는 2단계 재료다.
 
 기본은 비인증 호출(시간당 60회 제한)이다. 환경변수 GITHUB_TOKEN이 설정돼
 있으면 자동으로 Authorization 헤더를 붙여 시간당 5000회로 늘어난다 —
 토큰이 없어도 동작은 그대로라 기존 사용자에게 아무 영향이 없다.
 
-두 도구 모두 예외를 던지지 않고 "Error: ..." 문자열을 반환한다. 그래프 안에서
+네 도구 모두 예외를 던지지 않고 "Error: ..." 문자열을 반환한다. 그래프 안에서
 ToolNode가 도구를 호출하는데, 여기서 예외가 새면 그래프 실행 전체가 죽기
 때문에 실패(저장소 없음, rate limit, 네트워크 오류)도 반드시 정상적인
 반환값으로 표현해야 한다.
@@ -98,6 +106,60 @@ _MAX_CANDIDATES_BEFORE_STOP = 15
 _MAX_README_CHARS = 3000
 _MAX_SOURCE_FILES = 3
 _MAX_FILE_CHARS = 1500
+
+# fetch_repo_structure는 전체 본문 대신 시그니처만 보내므로 파일당 토큰이
+# 훨씬 적다 — 그만큼 더 많은 파일을 훑어서 "구조 지도"의 커버리지를 넓힌다.
+_MAX_STRUCTURE_FILES = 10
+_MAX_SIGNATURE_CHARS_PER_FILE = 800
+
+# fetch_repo_file은 사용자가 콕 집은 파일 하나만 보는 것이므로, 대표
+# 발췌(_MAX_FILE_CHARS)보다 훨씬 넉넉하게 허용한다.
+_MAX_SINGLE_FILE_CHARS = 8000
+
+# 확장자 그룹별로 "함수/클래스 선언부로 보이는 줄"을 잡아내는 정규식.
+# 정밀한 파서가 아니라 언어별 관례를 이용한 휴리스틱이다 — 본문 없이
+# 시그니처만 뽑아서 구조 지도의 토큰을 줄이는 게 목적이므로, 완벽할
+# 필요는 없고 "대충 구조가 보이는" 정도면 충분하다.
+_SIGNATURE_PATTERNS: list[tuple[frozenset[str], re.Pattern]] = [
+    (frozenset({".py"}), re.compile(r"^\s{0,4}(async\s+def\s|def\s|class\s)")),
+    (
+        frozenset({".js", ".jsx", ".ts", ".tsx"}),
+        re.compile(
+            r"^\s{0,4}(export\s+)?(default\s+)?(async\s+)?"
+            r"(function\b|class\b|const\s+\w+\s*=\s*(\([^)]*\)|\w+)\s*=>)"
+        ),
+    ),
+    (frozenset({".go"}), re.compile(r"^(func\b|type\s+\w+\s+(struct|interface)\b)")),
+    (
+        frozenset({".rs"}),
+        re.compile(r"^\s{0,4}(pub\s+)?(async\s+)?(fn\s|struct\s|enum\s|trait\s|impl\b)"),
+    ),
+    (
+        frozenset({".java", ".kt"}),
+        re.compile(
+            r"^\s{0,4}(public|private|protected)?\s*(static\s+)?(final\s+)?"
+            r"(class|interface|enum|fun)\b"
+        ),
+    ),
+    (frozenset({".rb"}), re.compile(r"^\s{0,4}(def\s|class\s|module\s)")),
+]
+
+
+def _extract_signatures(content: str, suffix: str) -> str:
+    """소스 코드 본문에서 함수/클래스 선언부(시그니처)로 보이는 줄만 뽑는다.
+
+    정밀한 AST 파서가 아니라 언어별 관례(들여쓰기 얕은 def/class/function
+    등으로 시작하는 줄)에 기대는 정규식 휴리스틱이다 — "본문 없이도 대충
+    구조가 보이는" 정도가 목적이라 완벽한 정확도는 필요 없다. 화이트리스트에
+    없는 확장자(.c/.cpp/.cs 등, 시그니처가 여러 줄에 걸치기 쉬워 한 줄
+    정규식으로는 신뢰도가 낮다)는 빈 문자열을 반환한다 — 호출부가 이 경우
+    해당 파일을 통째로 건너뛴다.
+    """
+    pattern = next((regex for exts, regex in _SIGNATURE_PATTERNS if suffix in exts), None)
+    if pattern is None:
+        return ""
+    lines = [line.rstrip() for line in content.splitlines() if pattern.match(line)]
+    return "\n".join(lines)
 
 
 def _score_source_candidate(path: str, size: int, primary_extensions: set[str]) -> int:
@@ -285,6 +347,29 @@ def _discover_source_candidates(repo: str, branch: str):
     return candidates, None
 
 
+def _fetch_file_raw(repo: str, path: str):
+    """path의 원본(raw) 텍스트 내용을 가져온다.
+
+    성공 시 (text, None), 실패 시 (None, 에러 문자열)을 반환한다.
+    fetch_repo_source_sample_text/fetch_repo_structure_text/
+    fetch_repo_file_text가 공통으로 쓰는 "파일 하나의 raw 내용 조회"
+    로직이다.
+    """
+    try:
+        response = requests.get(
+            f"{GITHUB_API_BASE}/repos/{repo}/contents/{path}",
+            headers=_auth_headers({"Accept": "application/vnd.github.v3.raw"}),
+            timeout=_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return None, f"(가져오기 실패: {exc})"
+    if response.status_code == 404:
+        return None, f"(가져오기 실패: 파일을 찾을 수 없습니다 — {path})"
+    if response.status_code != 200:
+        return None, f"(가져오기 실패: status={response.status_code})"
+    return response.text, None
+
+
 def fetch_repo_source_sample_text(repo: str) -> str:
     """저장소를 디렉토리 단위로 탐색해서 대표 소스 파일 몇 개를 골라 내용을 이어붙인다."""
     invalid = _validate_repo(repo)
@@ -312,21 +397,78 @@ def fetch_repo_source_sample_text(repo: str) -> str:
 
     sections = []
     for path in selected:
-        try:
-            file_response = requests.get(
-                f"{GITHUB_API_BASE}/repos/{repo}/contents/{path}",
-                headers=_auth_headers({"Accept": "application/vnd.github.v3.raw"}),
-                timeout=_REQUEST_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            sections.append(f"### {path}\n(가져오기 실패: {exc})")
+        text, error = _fetch_file_raw(repo, path)
+        if error:
+            sections.append(f"### {path}\n{error}")
             continue
-        if file_response.status_code != 200:
-            sections.append(f"### {path}\n(가져오기 실패: status={file_response.status_code})")
-            continue
-        sections.append(f"### {path}\n```\n{file_response.text[:_MAX_FILE_CHARS]}\n```")
+        sections.append(f"### {path}\n```\n{text[:_MAX_FILE_CHARS]}\n```")
 
     return "\n\n".join(sections)
+
+
+def fetch_repo_structure_text(repo: str) -> str:
+    """저장소를 fetch_repo_source_sample보다 훨씬 넓게 훑되, 파일 전체
+    본문이 아니라 함수/클래스 시그니처만 추출해서 "구조 지도"를 만든다.
+
+    스터디 모드의 1단계 재료다 — 같은 토큰 예산으로 fetch_repo_source_sample
+    (전체 본문, 파일 3개)보다 훨씬 많은 파일(_MAX_STRUCTURE_FILES)의
+    구조를 보여줘서, 코드를 한 줄도 안 읽고도 "이 저장소가 대략 어떻게
+    생겼는지" 감을 잡을 수 있게 한다. 시그니처 추출이 지원되지 않는
+    확장자(.c/.cpp/.cs 등)의 파일은 건너뛴다.
+    """
+    invalid = _validate_repo(repo)
+    if invalid:
+        return invalid
+
+    meta, error = _fetch_repo_metadata(repo)
+    if error:
+        return error
+    default_branch = meta.get("default_branch") or "main"
+
+    candidates, error = _discover_source_candidates(repo, default_branch)
+    if error:
+        return error
+    if not candidates:
+        return f"({repo}에서 구조를 파악할 소스 파일을 찾지 못했습니다.)"
+
+    primary_extensions = _LANGUAGE_EXTENSIONS.get((meta.get("language") or "").lower(), set())
+    candidates.sort(
+        key=lambda c: (-_score_source_candidate(c[0], c[1], primary_extensions), c[0])
+    )
+    selected = [path for path, _size in candidates[:_MAX_STRUCTURE_FILES]]
+
+    sections = []
+    for path in selected:
+        text, error = _fetch_file_raw(repo, path)
+        if error:
+            continue  # 구조 지도는 개요 성격이라, 파일 하나가 실패해도 조용히 건너뛴다.
+        signatures = _extract_signatures(text, Path(path).suffix)
+        if signatures:
+            sections.append(f"### {path}\n```\n{signatures[:_MAX_SIGNATURE_CHARS_PER_FILE]}\n```")
+
+    if not sections:
+        return f"({repo}에서 시그니처를 추출할 수 있는 파일을 찾지 못했습니다.)"
+    return "\n\n".join(sections)
+
+
+def fetch_repo_file_text(repo: str, path: str) -> str:
+    """저장소의 특정 파일 하나의 전체 내용을 가져온다.
+
+    스터디 모드의 2단계 재료다 — fetch_repo_structure로 구조 지도를 먼저
+    훑은 뒤, 관심 가는 파일 하나만 콕 집어 드릴다운할 때 쓴다. 대표
+    발췌(fetch_repo_source_sample)와 달리 어떤 파일을 볼지 사용자가
+    직접 지정하므로 탐색 없이 바로 조회한다.
+    """
+    invalid = _validate_repo(repo)
+    if invalid:
+        return invalid
+    if not path:
+        return "Error: 파일 경로(path)를 지정해야 합니다."
+
+    text, error = _fetch_file_raw(repo, path)
+    if error:
+        return f"Error: {path} {error}"
+    return f"### {path}\n```\n{text[:_MAX_SINGLE_FILE_CHARS]}\n```"
 
 
 @tool
@@ -338,6 +480,28 @@ def fetch_repo_overview(repo: str) -> str:
 
 @tool
 def fetch_repo_source_sample(repo: str) -> str:
-    """GitHub 저장소에서 대표적인 소스 파일 몇 개의 내용을 가져와 코드 리뷰에 쓴다.
+    """GitHub 저장소에서 대표적인 소스 파일 몇 개의 전체 내용을 가져와 정식
+    코드 리뷰에 쓴다. 토큰을 꽤 쓰므로, 사용자가 가볍게 구조만 훑어보고
+    싶어하면 대신 fetch_repo_structure를 쓴다.
     repo는 'owner/repo' 형식이어야 한다 (예: 'langchain-ai/langgraph')."""
     return fetch_repo_source_sample_text(repo)
+
+
+@tool
+def fetch_repo_structure(repo: str) -> str:
+    """GitHub 저장소를 넓게 훑어서 함수/클래스 시그니처만 담은 구조 지도를
+    가져온다(전체 코드 본문은 포함하지 않아 토큰을 훨씬 적게 쓴다). 사용자가
+    "구조만 보고 싶다"/"가볍게 훑어보고 싶다"/"공부하고 싶다"처럼 저장소를
+    처음 파악하려 할 때 fetch_repo_source_sample 대신 우선 사용한다.
+    repo는 'owner/repo' 형식이어야 한다 (예: 'langchain-ai/langgraph')."""
+    return fetch_repo_structure_text(repo)
+
+
+@tool
+def fetch_repo_file(repo: str, path: str) -> str:
+    """GitHub 저장소의 특정 파일 하나의 전체 내용을 가져온다. 사용자가
+    fetch_repo_structure로 본 구조 지도에서 특정 파일을 콕 집어 자세히
+    보고 싶어할 때(드릴다운) 사용한다.
+    repo는 'owner/repo' 형식, path는 저장소 루트 기준 파일 경로다
+    (예: 'src/requests/__init__.py')."""
+    return fetch_repo_file_text(repo, path)

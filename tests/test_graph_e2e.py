@@ -1,13 +1,14 @@
 """
 그래프 통합(E2E) 테스트.
 
-실제 도구(fetch_repo_overview, fetch_repo_source_sample)와 FakeChatModel을
-결합해서 그래프 전체가 dispatcher -> [repo_overview_node, repo_source_node]
-(도구 팬아웃) -> [voter_1, voter_2, voter_3] (투표형 앙상블 팬아웃) ->
-vote_for_best_report -> END 순서로 정상 동작하는지 검증한다. LLM 자체는
-가짜지만, GitHub API는 mock_github_get(conftest.py)으로 대체하고, 도구
-실행과 상태 병합(add_messages/operator.add reducer)은 실제 코드 경로를
-그대로 탄다.
+실제 도구(fetch_repo_overview, fetch_repo_source_sample, fetch_repo_structure,
+fetch_repo_file)와 FakeChatModel을 결합해서 그래프 전체가 dispatcher ->
+[repo_overview_node, repo_source_node, repo_structure_node, repo_file_node]
+(도구 팬아웃, 4-way) -> [voter_1, ..., voter_N] (투표형 앙상블 팬아웃, 기본
+N=3, num_voters로 조절) -> vote_for_best_report -> END 순서로 정상
+동작하는지 검증한다. LLM 자체는 가짜지만, GitHub API는
+mock_github_get(conftest.py)으로 대체하고, 도구 실행과 상태 병합
+(add_messages/operator.add reducer)은 실제 코드 경로를 그대로 탄다.
 
 가장 중요한 두 케이스:
 1. test_graph_votes_for_the_candidate_that_matches_tool_facts — 세 voter가
@@ -223,3 +224,115 @@ def test_graph_ignores_tool_calls_returned_by_voter_node(fake_llm_factory, mock_
     # call_2에 대한 ToolMessage는 존재하지 않는다 — 실행되지 않았다는 뜻.
     tool_call_ids = {m.tool_call_id for m in result["messages"] if isinstance(m, ToolMessage)}
     assert tool_call_ids == {"call_1"}
+
+
+def test_graph_study_mode_uses_a_single_voter_and_fewer_llm_calls(
+    fake_llm_factory, mock_github_get
+):
+    # num_voters=1(스터디 모드)이면 다수결 검증 없이 voter 1개의 시도가
+    # 그대로 채택되고, LLM 호출이 4번(dispatcher+voter 3)이 아니라
+    # 2번(dispatcher+voter 1)이어야 한다 — 무료 티어처럼 토큰이 빠듯할 때
+    # 정확도 대신 비용을 아끼려는 목적이다.
+    mock_github_get(
+        [
+            FakeResponse(200, json_data={"full_name": "octocat/hello-world"}),
+            FakeResponse(200, text="README"),
+        ]
+    )
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "fetch_repo_overview", "args": {"repo": "octocat/hello-world"}, "id": "call_1"}
+            ],
+        ),
+        AIMessage(content="이 저장소는 octocat/hello-world입니다."),
+    ]
+    llm = fake_llm_factory(responses)
+    graph = build_graph(llm, num_voters=1)
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="octocat/hello-world 구조만 훑어줘")],
+            "iteration": 0,
+            "report_drafts": [],
+        }
+    )
+
+    assert llm.calls == 2  # dispatcher 1 + voter 1 (voter 3이 아니다)
+    assert result["iteration"] == 2
+    assert len(result["report_drafts"]) == 1
+    assert result["messages"][-1].content == "이 저장소는 octocat/hello-world입니다."
+
+
+def test_graph_rejects_out_of_range_num_voters(fake_llm_factory):
+    llm = fake_llm_factory([])
+
+    try:
+        build_graph(llm, num_voters=0)
+        assert False, "num_voters=0은 ValueError를 내야 한다"
+    except ValueError:
+        pass
+
+    try:
+        build_graph(llm, num_voters=4)
+        assert False, "voter 정의(VOTER_LABELS)보다 많은 num_voters는 ValueError를 내야 한다"
+    except ValueError:
+        pass
+
+
+def test_graph_dispatches_structure_and_file_tools_together(
+    fake_llm_factory, mock_github_get_by_path
+):
+    # fetch_repo_structure(구조 지도)와 fetch_repo_file(특정 파일 드릴다운)
+    # 도 나머지 두 도구와 동일한 4-way 팬아웃 배선을 탄다는 것을 확인한다.
+    # 두 도구 노드가 같은 팬아웃 라운드에서 병렬로(스레드 풀) 실행되므로,
+    # 순수 호출 순서(QueuedGet)로는 어느 응답이 어느 노드로 갔는지 보장할
+    # 수 없다 — URL 기반 매칭(mock_github_get_by_path)을 쓴다. 두 도구가
+    # 서로 다른 파일(main.py/utils.py)을 보게 해서 URL이 겹치지 않게 한다.
+    mock_github_get_by_path(
+        {
+            "contents/main.py": [FakeResponse(200, text="def main(): pass")],
+            "contents/utils.py": [FakeResponse(200, text="def helper():\n    print('hi')\n")],
+            "hello-world/contents": [
+                FakeResponse(200, json_data=[{"path": "main.py", "type": "file", "size": 500}])
+            ],
+            "repos/octocat/hello-world": [
+                FakeResponse(200, json_data={"default_branch": "main", "language": "Python"})
+            ],
+        }
+    )
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "fetch_repo_structure",
+                    "args": {"repo": "octocat/hello-world"},
+                    "id": "call_structure",
+                },
+                {
+                    "name": "fetch_repo_file",
+                    "args": {"repo": "octocat/hello-world", "path": "utils.py"},
+                    "id": "call_file",
+                },
+            ],
+        ),
+        AIMessage(content="구조와 utils.py 내용을 확인했습니다."),
+        AIMessage(content="구조와 utils.py 내용을 확인했습니다."),
+        AIMessage(content="구조와 utils.py 내용을 확인했습니다."),
+    ]
+    llm = fake_llm_factory(responses)
+    graph = build_graph(llm)
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="octocat/hello-world 구조 보여주고 utils.py도 보여줘")],
+            "iteration": 0,
+            "report_drafts": [],
+        }
+    )
+
+    tool_messages = {m.tool_call_id: m.content for m in result["messages"] if isinstance(m, ToolMessage)}
+    assert "def main(): pass" in tool_messages["call_structure"]
+    assert "print('hi')" in tool_messages["call_file"]

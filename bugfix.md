@@ -323,3 +323,68 @@ recursive=1 트리 API는 "저장소 전체를 한 번에 훑고 싶을 때" 쓰
 - `tests/test_tools.py` — 재귀 트리 엔드포인트 미사용 회귀, 호출 횟수 상한,
   하위 디렉토리 실패 허용, 깊이 우선 탐색(얕은 형제보다 깊은 코드 우선),
   테스트 파일명 제외 등 회귀 테스트 추가
+
+---
+
+# Bugfix: 서로 다른 두 도구 노드가 병렬로 호출하면 `QueuedGet` 응답이 뒤섞이던 문제
+
+## 증상
+
+스터디 모드용 도구(`fetch_repo_structure`/`fetch_repo_file`)를 추가하면서, 두
+도구를 한 메시지에서 함께 호출하는 그래프 E2E 테스트를 작성했다.
+`repo_structure_node`(GitHub API 3번 호출: 메타데이터→디렉토리 나열→파일
+내용)와 `repo_file_node`(1번 호출: 파일 내용)를 `mock_github_get`(순수 FIFO
+큐)으로 모킹하고 응답 4개를 순서대로 준비했는데, 어느 응답이 어느 노드로
+갔는지 매번 달라졌다 — 어떤 실행에서는 `repo_file_node`가 `repo_structure_node`
+용으로 준비해둔 메타데이터 JSON을 받아가 `'list' object has no attribute
+'get'` 같은 엉뚱한 예외가 났다.
+
+## 원인
+
+`repo_overview_node`/`repo_source_node`/`repo_structure_node`/`repo_file_node`
+는 같은 팬아웃 라운드에 속한 별개의 그래프 노드라서, LangGraph가 이들을
+**스레드 풀에서 병렬로** 실행한다(voter 3개를 동시에 부르는 것과 같은
+메커니즘). `repo_structure_node`가 3번의 `requests.get` 호출을 순차적으로
+하는 도중에, 다른 스레드에서 실행 중인 `repo_file_node`의 1번짜리 호출이
+끼어들 수 있다. `QueuedGet`은 URL을 보지 않고 그냥 "호출된 순서대로" 큐에서
+하나씩 꺼내주므로, 두 노드의 호출이 인터리빙되면 완전히 엉뚱한 응답이
+배정된다.
+
+도구 하나가 순차적으로 여러 번 호출하는 기존 테스트들(`fetch_repo_source_sample`
+단독 등)은 애초에 경쟁할 다른 호출자가 없어서 이 문제를 겪지 않았다 — "여러
+도구 노드가 각자 여러 번 호출하며 동시에 실행되는" 조합에서만 드러나는
+문제였다.
+
+## 해결
+
+URL에 포함된 부분 문자열로 응답을 찾아주는 `PathAwareQueuedGet`을
+`tests/conftest.py`에 새로 추가했다(`mock_github_get_by_path` 픽스처).
+`{URL 부분 문자열: [응답, ...]}` 형태의 dict를 받아서, 호출된 URL에 해당
+문자열이 포함된 첫 번째 키의 큐에서 응답을 꺼낸다 — 순서가 아니라 "무엇을
+요청했는가"로 응답을 고르므로 병렬 호출에도 안전하다. 키 순서가
+구체적인 것부터(예: `"contents/main.py"`) 일반적인 것까지(예:
+`"repos/octocat/hello-world"`) 오도록 신경 써야 한다 — `in` 연산자로 첫
+매치를 쓰므로, 일반적인 키가 먼저 오면 구체적인 URL도 그 키에 잘못
+걸릴 수 있다.
+
+기존 `QueuedGet`에도 `FakeChatModel`과 동일한 이유로(voter 3개가 동시에
+호출하는 것과 같은 패턴) `threading.Lock`을 추가했다 — 다만 이건 "같은
+응답을 두 스레드가 훔쳐가는" 경합만 막을 뿐, 애초에 뒤섞인 호출 순서
+자체는 못 고친다. 그래서 순차 호출(도구 하나)에는 `QueuedGet`을, 병렬
+호출(도구 여럿이 동시에)에는 `PathAwareQueuedGet`을 구분해서 쓴다.
+
+## 교훈
+
+모킹 인프라를 설계할 때 "실제로 어떻게 호출되는가"(순차 vs 병렬)를 먼저
+따져야 한다. `QueuedGet`은 도구 하나의 순차 호출 시나리오에서는 완벽하게
+결정적이지만, 그 가정이 깨지는 순간(다른 노드가 동시에 같은 더미를 두드림)
+조용히 잘못된 응답을 돌려준다 — 테스트가 실패하는 게 아니라 **엉뚱한
+데이터로 통과하거나, 이번처럼 예외를 던지며 실패**하는 두 갈래로 갈릴 수
+있어서 원인 파악이 헷갈리기 쉽다.
+
+## 관련 파일
+
+- `tests/conftest.py` — `PathAwareQueuedGet`/`mock_github_get_by_path` 추가,
+  기존 `QueuedGet`에 `threading.Lock` 추가
+- `tests/test_graph_e2e.py` — `test_graph_dispatches_structure_and_file_tools_together`
+  가 `mock_github_get_by_path` 사용
