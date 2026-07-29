@@ -68,7 +68,7 @@ def test_graph_votes_for_the_candidate_that_matches_tool_facts(fake_llm_factory,
     mock_github_get(
         [
             FakeResponse(200, json_data={"default_branch": "main"}),
-            FakeResponse(200, json_data={"tree": [{"path": "main.py", "type": "blob"}]}),
+            FakeResponse(200, json_data=[{"path": "main.py", "type": "file", "size": 500}]),
             FakeResponse(200, text="def main(): pass"),
         ]
     )
@@ -113,7 +113,7 @@ def test_graph_fans_out_both_tools_then_fans_out_three_voters(fake_llm_factory, 
             FakeResponse(200, text="README"),
             # repo_source_node
             FakeResponse(200, json_data={"default_branch": "main"}),
-            FakeResponse(200, json_data={"tree": [{"path": "main.py", "type": "blob"}]}),
+            FakeResponse(200, json_data=[{"path": "main.py", "type": "file", "size": 500}]),
             FakeResponse(200, text="def main(): pass"),
         ]
     )

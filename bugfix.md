@@ -244,3 +244,82 @@ _SKIP_PATH_PARTS = {
 - `agent/tools.py` — `_SKIP_PATH_PARTS`에 예제/데모 경로 추가
 - `tests/test_tools.py` — `test_fetch_repo_source_sample_text_excludes_examples_directory`
   회귀 테스트 추가
+
+---
+
+# Bugfix: 대형 저장소에서 GitHub 응답이 너무 커서 리뷰가 사실상 불가능하던 문제
+
+## 증상
+
+사용자가 "GitHub 용량이 너무 커서 리뷰가 불가능하다"고 지적했다. API 키 없이
+(GitHub API만으로) 재현해보니 실제로 심각했다.
+
+```python
+r = requests.get('https://api.github.com/repos/torvalds/linux/git/trees/master',
+                  params={'recursive': '1'})
+# truncated: True, tree 항목 71,798개, 응답 17.6MB
+r = requests.get('https://api.github.com/repos/kubernetes/kubernetes/git/trees/master',
+                  params={'recursive': '1'})
+# truncated: False, tree 항목 37,390개, 응답 10.3MB
+```
+
+`fetch_repo_source_sample_text`가 파일 3개만 골라 쓰려고 저장소 **전체** 파일
+목록을 `/git/trees/{branch}?recursive=1`로 한 번에 받고 있었던 것이 원인이었다.
+linux 커널 같은 극단적인 경우는 GitHub이 아예 응답을 잘라버려서(`truncated:
+true`) 일부 파일은 애초에 후보에 들어오지도 못했다.
+
+## 원인
+
+recursive=1 트리 API는 "저장소 전체를 한 번에 훑고 싶을 때" 쓰라고 있는
+엔드포인트인데, 우리 용도는 정반대(파일 몇 개만 대표로 보면 됨)였다. 요청
+자체는 1번이라 GitHub API 호출 횟수(rate limit) 관점에서는 저렴해 보이지만,
+응답 크기·다운로드 시간·JSON 파싱 비용은 저장소 크기에 비례해서 커진다.
+
+## 해결
+
+디렉토리를 하나씩(비재귀) 나열하는 `/repos/{repo}/contents/{path}`로 바꾸고,
+**깊이 우선(DFS)** + 힌트 디렉토리(`src`/`lib`/`pkg`/`cmd`/...) 우선 탐색으로
+필요한 만큼만 내려간다(`_discover_source_candidates()`). 호출 횟수
+(`_MAX_DIR_LISTING_CALLS`, 8회)나 모인 후보 수(15개)가 충분해지면 멈춘다.
+
+처음엔 너비 우선(BFS)으로 만들었는데, `kubernetes/kubernetes`로 검증하자마자
+빈 결과가 나왔다. 원인을 보니: 그 저장소는 루트 바로 아래에 `cmd`/`pkg`
+같은 컴포넌트 디렉토리가 20개 넘게 있고, 그 안에도 또 컴포넌트별 하위
+디렉토리가 잔뜩 있어서 실제 `.go` 코드는 3~4단계는 더 들어가야 나온다. BFS는
+"같은 깊이의 모든 디렉토리를 다 훑은 뒤에야 한 단계 더 내려가는" 방식이라,
+호출 예산(당시 5회)을 얕은 형제 디렉토리들을 옆으로 훑는 데 다 써버리고 단
+하나의 파일도 못 찾았다. DFS로 바꾸고(힌트 디렉토리를 스택에 나중에 넣어서
+먼저 꺼내지게 함) 예산을 8회로 늘리자 `pkg/volume/*.go` 같은 실제 구현
+파일을 찾아냈다.
+
+```
+# 이전 (recursive=1): kubernetes/kubernetes에서 10MB 다운로드 후에도 무거움
+# 이후 (BFS 디렉토리 나열, 5회 예산): "리뷰할 소스 파일을 찾지 못했습니다"
+# 이후 (DFS + 힌트 우선, 8회 예산): 3.8KB, 2.8초
+### pkg/volume/doc.go
+### pkg/volume/metrics_block.go
+### pkg/volume/metrics_cached.go
+```
+
+이 과정에서 파생 문제도 하나 발견했다: Go는 `tests/` 같은 디렉토리 관례
+대신 같은 디렉토리에 `foo.go`/`foo_test.go`를 나란히 두는 명명 관례를
+쓰는데, 기존 `_SKIP_PATH_PARTS`(디렉토리명 기반)로는 `metrics_block_linux_test.go`
+같은 파일이 걸러지지 않았다. `_looks_like_test_file()`을 추가해서 파일명
+접미사(`_test`/`.test`/`.spec`/`test_` 접두사)로도 걸러내도록 고쳤다.
+
+## 교훈
+
+- API 호출 "횟수"만 아끼면 안 된다 — 응답 "크기"도 비용이다. recursive=1은
+  호출 1번이라 저렴해 보였지만 실제로는 리뷰 목적에 안 맞는 과도한 데이터였다.
+- 휴리스틱(BFS든 DFS든)을 코드만 보고 옳다고 판단하지 말고, 실제로 구조가
+  극단적인 저장소(이번엔 kubernetes/kubernetes)로 돌려봐야 문제가 드러난다.
+  작은 테스트 픽스처는 "얕고 좁은" 구조만 만들 뿐, "얕고 넓다가 깊은 곳에
+  코드가 몰린" 실제 모노레포 구조를 우연히라도 재현하기 어렵다.
+
+## 관련 파일
+
+- `agent/tools.py` — `_list_directory`, `_discover_source_candidates`,
+  `_looks_like_test_file`, `fetch_repo_source_sample_text` 재작성
+- `tests/test_tools.py` — 재귀 트리 엔드포인트 미사용 회귀, 호출 횟수 상한,
+  하위 디렉토리 실패 허용, 깊이 우선 탐색(얕은 형제보다 깊은 코드 우선),
+  테스트 파일명 제외 등 회귀 테스트 추가

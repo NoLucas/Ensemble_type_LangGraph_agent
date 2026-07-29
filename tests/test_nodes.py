@@ -339,7 +339,7 @@ def test_repo_source_node_executes_matching_tool_call(mock_github_get):
     mock_github_get(
         [
             FakeResponse(200, json_data={"default_branch": "main"}),
-            FakeResponse(200, json_data={"tree": [{"path": "main.py", "type": "blob"}]}),
+            FakeResponse(200, json_data=[{"path": "main.py", "type": "file", "size": 500}]),
             FakeResponse(200, text="print('hi')"),
         ]
     )

@@ -46,6 +46,16 @@ _SKIP_PATH_PARTS = {
     "example", "examples", "demo", "demos", "sample", "samples",
 }
 
+
+def _looks_like_test_file(path: str) -> bool:
+    """디렉토리명이 아니라 파일명 자체가 테스트 파일 명명 관례를 따르는지
+    본다. `tests/` 같은 디렉토리 관례(_SKIP_PATH_PARTS)와 달리, Go는
+    같은 디렉토리에 `foo.go`/`foo_test.go`를 나란히 두는 관례를 쓴다 —
+    kubernetes/kubernetes로 수동 검증하다가 `metrics_block_linux_test.go`
+    가 걸러지지 않는 걸 발견하고 추가했다."""
+    stem = Path(path).stem.lower()
+    return stem.endswith("_test") or stem.endswith(".test") or stem.endswith(".spec") or stem.startswith("test_")
+
 # GitHub 저장소 메타데이터의 language 필드(예: "Python") -> 그 언어의 대표
 # 확장자. 소스 파일 후보를 고를 때 "저장소의 실제 주 언어와 일치하는 파일"에
 # 가산점을 준다 — 화이트리스트에 여러 언어 확장자가 섞여 있다 보니, 예를 들어
@@ -72,6 +82,18 @@ _ENTRYPOINT_STEMS = {"main", "__main__", "__init__", "index", "app", "cli", "ser
 # (또 어차피 _MAX_FILE_CHARS로 잘려서 앞부분만 봐도 대표성이 떨어진다).
 _MIN_USEFUL_FILE_SIZE = 50
 _MAX_USEFUL_FILE_SIZE = 20000
+
+# 소스 파일이 있을 법한 디렉토리 이름 — 탐색 큐에서 이 이름과 일치하는
+# 디렉토리를 먼저 방문한다.
+_SOURCE_DIR_HINTS = {"src", "lib", "app", "pkg", "cmd", "core", "source"}
+# 디렉토리 나열(비재귀) API를 몇 번까지 호출할지의 상한. 저장소 전체를
+# recursive=1로 한 번에 받는 대신 디렉토리 단위로 필요한 만큼만 탐색하기
+# 위한 예산이다 — 아래 _discover_source_candidates() 참고. DFS라 유망한
+# 경로 하나가 몇 단계 안쪽에서야 파일을 내놓는 저장소(kubernetes/kubernetes
+# 등 대형 모노레포)도 감안해서 여유를 좀 둔다.
+_MAX_DIR_LISTING_CALLS = 8
+# 이만큼 후보가 모이면 더 탐색하지 않고 채점 단계로 넘어간다.
+_MAX_CANDIDATES_BEFORE_STOP = 15
 
 _MAX_README_CHARS = 3000
 _MAX_SOURCE_FILES = 3
@@ -178,8 +200,93 @@ def fetch_repo_overview_text(repo: str) -> str:
     return "\n".join(lines)
 
 
+def _list_directory(repo: str, path: str, branch: str):
+    """path 바로 아래 항목만(비재귀) 나열한다.
+
+    성공 시 (entries, None), 실패 시 (None, 에러 문자열)을 반환한다.
+    `path`가 빈 문자열이면 저장소 루트를 나열한다.
+    """
+    url = f"{GITHUB_API_BASE}/repos/{repo}/contents/{path}" if path else f"{GITHUB_API_BASE}/repos/{repo}/contents"
+    try:
+        response = requests.get(
+            url, params={"ref": branch}, headers=_auth_headers(), timeout=_REQUEST_TIMEOUT
+        )
+    except requests.RequestException as exc:
+        return None, f"Error: 파일 목록을 가져오지 못했습니다 ({exc})"
+    if response.status_code != 200:
+        return None, f"Error: 파일 목록을 가져오지 못했습니다 (status={response.status_code})."
+    data = response.json()
+    # contents API는 path가 디렉토리면 항목 리스트를, 파일이면 단일 객체를
+    # 반환한다 — 후자는 우리가 기대한 모양이 아니므로 빈 목록으로 취급한다.
+    return (data if isinstance(data, list) else []), None
+
+
+def _discover_source_candidates(repo: str, branch: str):
+    """디렉토리를 하나씩(비재귀) 나열하며 소스 파일 후보를 모은다.
+
+    예전에는 /git/trees/{branch}?recursive=1로 저장소 전체 파일 목록을
+    한 번에 받았는데, 이러면 큰 저장소(예: kubernetes/kubernetes)에서도
+    응답이 수 MB~수십 MB에 달하고(실측: kubernetes 10MB/37,390개 항목,
+    linux 17.6MB/71,798개 항목이면서 truncated=True로 일부 누락) 리뷰
+    목적(파일 몇 개만 보면 됨)에 비해 지나치게 무겁고 느리다.
+
+    대신 저장소를 **깊이 우선(DFS)**으로 탐색한다 — 스택에서 마지막에
+    넣은 항목을 먼저 꺼내되, src/lib처럼 소스가 있을 법한 디렉토리를
+    나중에 넣어서(=먼저 꺼내져서) 우선 파고들게 한다. 너비 우선(BFS)으로
+    먼저 만들어봤다가 kubernetes/kubernetes로 실제 검증 중 문제를
+    발견했다: 그 저장소는 실제 .go 코드가 `pkg/`, `cmd/` 몇 단계 더
+    안쪽에 있는데, 루트 바로 아래에는 컴포넌트별 하위 디렉토리(26개+)만
+    잔뜩 있어서 BFS는 그 얕은 디렉토리들을 옆으로 훑다가 호출 예산을
+    다 써버리고 파일을 하나도 못 찾았다. DFS는 유망해 보이는 경로 하나를
+    바닥까지 파고든 뒤에야 옆 가지로 넘어가므로, "코드가 몇 단계 안쪽에
+    몰려 있는" 실제 저장소 구조에 훨씬 잘 맞는다.
+
+    호출 횟수(_MAX_DIR_LISTING_CALLS)나 모인 후보 수
+    (_MAX_CANDIDATES_BEFORE_STOP)가 충분해지면 멈춘다.
+
+    반환: (candidates, error). candidates는 (path, size) 튜플 리스트.
+    루트 디렉토리 조회 자체가 실패하면 error를 반환한다. 그 이후
+    탐색에서 개별 하위 디렉토리 조회가 실패하는 것은(권한/일시적 오류 등)
+    전체 탐색을 포기할 이유가 아니므로 그 디렉토리만 건너뛴다.
+    """
+    candidates: list[tuple[str, int]] = []
+    stack = [""]
+    calls = 0
+    is_root = True
+
+    while stack and calls < _MAX_DIR_LISTING_CALLS and len(candidates) < _MAX_CANDIDATES_BEFORE_STOP:
+        current_dir = stack.pop()
+        entries, error = _list_directory(repo, current_dir, branch)
+        calls += 1
+        if error:
+            if is_root:
+                return [], error
+            entries = []
+        is_root = False
+
+        subdirs = []
+        for entry in entries:
+            path = entry.get("path", "")
+            if entry.get("type") == "file":
+                if (
+                    Path(path).suffix in _SOURCE_EXTENSIONS
+                    and not (_SKIP_PATH_PARTS & set(Path(path).parts))
+                    and not _looks_like_test_file(path)
+                ):
+                    candidates.append((path, entry.get("size", 0)))
+            elif entry.get("type") == "dir":
+                if Path(path).name.lower() not in _SKIP_PATH_PARTS:
+                    subdirs.append(path)
+        # 힌트가 아닌 디렉토리를 먼저 스택에 넣고, 힌트 디렉토리를 나중에
+        # 넣는다 — 스택은 LIFO라 나중에 넣은(힌트) 쪽이 먼저 꺼내진다.
+        subdirs.sort(key=lambda p: Path(p).name.lower() in _SOURCE_DIR_HINTS)
+        stack.extend(subdirs)
+
+    return candidates, None
+
+
 def fetch_repo_source_sample_text(repo: str) -> str:
-    """저장소 트리에서 대표 소스 파일 몇 개를 골라 내용을 이어붙인다."""
+    """저장소를 디렉토리 단위로 탐색해서 대표 소스 파일 몇 개를 골라 내용을 이어붙인다."""
     invalid = _validate_repo(repo)
     if invalid:
         return invalid
@@ -189,35 +296,19 @@ def fetch_repo_source_sample_text(repo: str) -> str:
         return error
     default_branch = meta.get("default_branch") or "main"
 
-    try:
-        tree_response = requests.get(
-            f"{GITHUB_API_BASE}/repos/{repo}/git/trees/{default_branch}",
-            params={"recursive": "1"},
-            headers=_auth_headers(),
-            timeout=_REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        return f"Error: 파일 목록을 가져오지 못했습니다 ({exc})"
-    if tree_response.status_code != 200:
-        return f"Error: 파일 목록을 가져오지 못했습니다 (status={tree_response.status_code})."
+    candidates, error = _discover_source_candidates(repo, default_branch)
+    if error:
+        return error
+    if not candidates:
+        return f"({repo}에서 리뷰할 소스 파일을 찾지 못했습니다.)"
 
     primary_extensions = _LANGUAGE_EXTENSIONS.get((meta.get("language") or "").lower(), set())
-    candidates = [
-        (item["path"], item.get("size", 0))
-        for item in tree_response.json().get("tree", [])
-        if item.get("type") == "blob"
-        and Path(item["path"]).suffix in _SOURCE_EXTENSIONS
-        and not (_SKIP_PATH_PARTS & set(Path(item["path"]).parts))
-    ]
     # 점수 높은 순(주 언어 일치 > 진입점 파일명 > 얕은 경로 > 적당한 크기),
     # 동점이면 경로 이름순으로 결정론적으로 정렬한다.
     candidates.sort(
         key=lambda c: (-_score_source_candidate(c[0], c[1], primary_extensions), c[0])
     )
     selected = [path for path, _size in candidates[:_MAX_SOURCE_FILES]]
-
-    if not selected:
-        return f"({repo}에서 리뷰할 소스 파일을 찾지 못했습니다.)"
 
     sections = []
     for path in selected:
